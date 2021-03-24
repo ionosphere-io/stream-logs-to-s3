@@ -4,7 +4,9 @@ use std::{
     cmp::min,
     collections::HashMap,
     env,
+    error::Error,
     ffi::OsString,
+    fs::metadata,
     io::{self, stderr, stdout, SeekFrom, Write},
     iter::Extend,
     net::IpAddr,
@@ -12,6 +14,9 @@ use std::{
     process::exit,
     time::Duration,
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::FileTypeExt;
 
 use async_compression::{tokio::write::GzipEncoder, Level};
 use base32;
@@ -23,7 +28,7 @@ use get_if_addrs::get_if_addrs;
 use gethostname::gethostname;
 use getopts::Options;
 use humantime::parse_duration;
-use log::{debug, error};
+use log::{debug, info, error};
 use rand::{thread_rng, RngCore};
 use rusoto_core::{ByteStream, Region};
 use rusoto_s3::{
@@ -34,10 +39,18 @@ use tempfile::{NamedTempFile, TempPath};
 use tokio::{
     self,
     fs::File,
-    io::{stdin, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, Stdin},
+    io::{stdin, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
+    runtime::{Builder as RuntimeBuilder},
     select,
 };
 use tokio_util::io::ReaderStream;
+
+#[cfg(unix)]
+use nix::{
+    Error as NixError,
+    errno::Errno,
+    unistd::{AccessFlags, access},
+};
 
 mod async_utils;
 mod ec2;
@@ -47,6 +60,9 @@ use crate::async_utils::{MaybeCompressedFile, MaybeTimeout, TaskQueue};
 use crate::error::{InvalidS3URL, SendFileError};
 use ec2::get_host_id_from_ec2_metadata;
 use ecs::get_host_id_from_ecs_metadata;
+
+#[cfg(not(unix))]
+use crate::error::BadFileTypeError;
 
 /// The default duration to buffer logs for (1 hour).
 const DEFAULT_DURATION: Duration = Duration::from_secs(3600);
@@ -64,15 +80,11 @@ const MAX_PART_SIZE: u64 = 10 << 20;
 /// The prefix for S3 URLs.
 const S3_PROTO_PREFIX: &str = "s3://";
 
-/// InputSource allows us to use either a file or stdin as a source of data.
-enum InputSource {
-    File(File),
-    Stdin(Stdin),
-}
+/// How often we log size information.
+const SIZE_REPORTING_INTERVAL: u64 = 10 << 20;
 
 /// Program entrypoint. Parse options and, if they seem reasonable, fire up the main routine (run).
-#[tokio::main]
-async fn main() {
+fn main() {
     env_logger::init();
     let args: Vec<String> = env::args().collect();
     let program = args[0].clone();
@@ -124,21 +136,13 @@ acceptable to the byte_unit crate, e.g., \"123KiB\".",
 
     let compress = matches.opt_present("z");
 
-    let input_file = match matches.opt_str("i") {
-        None => InputSource::Stdin(stdin()),
-        Some(filename) => match File::open(filename.clone()).await {
-            Ok(f) => InputSource::File(f),
-            Err(e) => {
-                eprintln!("Unable to open {:?}: {:?}", filename, e);
-                exit(1);
-            }
-        },
-    };
-
     let max_duration = match matches.opt_str("d") {
         None => DEFAULT_DURATION,
         Some(duration_str) => match parse_duration(&duration_str) {
-            Ok(duration) => duration,
+            Ok(duration) => {
+                eprintln!("Using duration {:?}", duration);
+                duration
+            }
             Err(e) => {
                 eprintln!("Unable to parse {:#} as a valid duration: {:#}", duration_str, e);
                 eprintln!();
@@ -190,7 +194,6 @@ acceptable to the byte_unit crate, e.g., \"123KiB\".",
     }
 
     let destination = &matches.free[0];
-    let host_id = get_host_id().await;
 
     let (bucket, object_name_pattern) = match parse_s3_url(destination) {
         Ok((bucket, onp)) => (bucket, onp),
@@ -201,14 +204,44 @@ acceptable to the byte_unit crate, e.g., \"123KiB\".",
         }
     };
 
-    match input_file {
-        InputSource::File(f) => {
-            run(f, &host_id, max_size, max_duration, &temp_dir, &bucket, &object_name_pattern, compress).await.unwrap()
+    let input_file = match matches.opt_str("i") {
+        None => None,
+        // Don't attempt to open the file; if it's a FIFO, we will stall until a byte is available.
+        Some(filename) => match likely_can_open_file(&filename) {
+            Ok(()) => Some(filename),
+            Err(e) => {
+                eprintln!("Unable to open {:?}: {:?}", filename, e);
+                exit(1);
+            }
+        },
+    };
+
+    debug!("About to get host id");
+    let runtime = match RuntimeBuilder::new_current_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            error!("Unable to build Tokio runtime: {:?}", e);
+            exit(100);
         }
-        InputSource::Stdin(s) => {
-            run(s, &host_id, max_size, max_duration, &temp_dir, &bucket, &object_name_pattern, compress).await.unwrap()
+    };
+
+    runtime.block_on(async {
+        let host_id = get_host_id().await;
+        debug!("Using host_id {:?}", host_id);
+
+        stderr().flush().unwrap();
+        match input_file {
+            Some(filename) => {
+                match File::open(filename.clone()).await {
+                    Ok(f) => 
+                        run(f, &host_id, max_size, max_duration, &temp_dir, &bucket, &object_name_pattern, compress).await.unwrap(),
+                    Err(e) => error!("Unable to open {:?}: {:?}", filename, e),
+                }
+            }
+            None =>
+                run(stdin(), &host_id, max_size, max_duration, &temp_dir, &bucket, &object_name_pattern, compress).await.unwrap()
         }
-    }
+    });
 }
 
 /// The main loop of the program. Under normal conditions, this returns only when the input stream is closed.
@@ -224,14 +257,17 @@ async fn run<R: AsyncRead>(
 ) -> io::Result<()> {
     let mut reader = Box::pin(BufReader::with_capacity(65536, reader));
     let mut send_futures = TaskQueue::new();
+    info!("Loop starting with max_size {:?} and max_duration {:?}", max_size, max_duration);
 
     'outer: loop {
         let mut current_size: u64 = 0;
-        let mut buf = Vec::with_capacity(65536);
+        let mut last_reported_size: u64 = 0;
+        let mut buf: [u8; 65536] = [0; 65536];
 
         // Create a named temp file for recording data. We need to reopen this file for multipart uploads since
         // Rust doesn't let us dup() a file handle (yet).
         let (std_file, temp_path) = NamedTempFile::new_in(temp_dir)?.into_parts();
+        debug!("Opened log file {:?}", temp_path);
 
         // Don't start the timer until the first byte is read. We initialize it here with a future that will never
         // complete.
@@ -247,6 +283,7 @@ async fn run<R: AsyncRead>(
         loop {
             select! {
                 _ = &mut timeout => {
+                    info!("Timeout hit; sending log file {:?} to S3", temp_path);
                     // We've hit the timeout limit. Send the file to S3.
                     match evaluate_pattern(object_name_pattern, host_id) {
                         Ok(object_name) => send_futures.push(send_file(file, temp_path, host_id.to_string(), bucket.to_string(), object_name)),
@@ -255,10 +292,14 @@ async fn run<R: AsyncRead>(
                     break;
                 }
 
-                read_result = reader.read_until('\n' as u8, &mut buf) => {
+                read_result = reader.read(&mut buf) => {
                     // Incoming bytes from stdin/FIFO.
-
                     let (flush_required, bad_reader) = match read_result {
+                        Ok(0) => {
+                            // Input stream is closed
+                            debug!("No data returned; assuming input stream has closed");
+                            (true, true)
+                        }
                         Ok(n_read) => {
                             // Write the bytes to the temporary file
                             match file.write_all(&buf[0..n_read]).await {
@@ -266,12 +307,19 @@ async fn run<R: AsyncRead>(
                                     if current_size == 0 {
                                         // First byte written. Start the timer.
                                         timeout = MaybeTimeout::sleep(max_duration);
+                                        debug!("First byte written; started timer for {:?}", max_duration);
                                     }
 
                                     // Ideally, we'd like to record the compressed size of the file, but there isn't
                                     // an easy way to do that especially since compression algorithms keep data
                                     // buffered. Just record the uncompressed size.
                                     current_size += n_read as u64;
+
+                                    if current_size > last_reported_size + SIZE_REPORTING_INTERVAL {
+                                        debug!("Current file size is {:?}", current_size);
+                                        last_reported_size = current_size;
+                                    }
+
                                     (current_size >= max_size, false)
                                 }
                                 Err(e) => {
@@ -282,15 +330,15 @@ async fn run<R: AsyncRead>(
                                 }
                             }
                         }
-                        Err(_e) => {
+                        Err(e) => {
                             // Incoming stream has shut down.
+                            info!("Incoming stream has shut down: {:?}", e);
                             (true, true)
                         }
                     };
 
-                    buf.clear();
-
                     if flush_required {
+                        info!("Size limit hit (or stream shutdown); sending log file {:?} to S3", temp_path);
                         // We need to flush to S3 -- either we're full or an issue occurred.
                         match evaluate_pattern(object_name_pattern, host_id) {
                             Ok(object_name) => {
@@ -306,6 +354,7 @@ async fn run<R: AsyncRead>(
                 }
 
                 result = send_futures.next() => {
+                    debug!("send_future: {:?}", result);
                     // One of the S3 jobs has completed.
                     match result {
                         Some((path, object_name, result)) => debug!("File {:?} -> s3://{}/{}: {:?}", path, bucket, object_name, result),
@@ -313,6 +362,14 @@ async fn run<R: AsyncRead>(
                     }
                 }
             }
+        }
+    }
+
+    // Drain any upload tasks.
+    while send_futures.len() > 0 {
+        match send_futures.next().await {
+            Some((path, object_name, result)) => debug!("File {:?} -> s3://{}/{}: {:?}", path, bucket, object_name, result),
+            None => debug!("Busy wait on send_futures"),
         }
     }
 
@@ -382,7 +439,7 @@ async fn do_send_file(
 async fn send_file_single(
     file: File,
     size: u64,
-    _path: TempPath,
+    path: TempPath,
     host_id: String,
     bucket: String,
     object_name: String,
@@ -401,7 +458,8 @@ async fn send_file_single(
 
     let reader = ReaderStream::new(file);
     por.body = Some(ByteStream::new_with_size(reader, size as usize));
-
+    
+    info!("Performing single upload for {:?} of size {:?}", path, size);
     match s3.put_object(por).await {
         Ok(_) => Ok(()),
         Err(e) => {
@@ -430,6 +488,7 @@ async fn send_file_multi(
     // XXX -- allow tagging to be specified.
     cmur.tagging = Some(format!("HostId={}", host_id));
 
+    info!("Performing multipart upload for {:?} of size {}", path, size);
     let upload_id = match s3.create_multipart_upload(cmur).await {
         Ok(resp) => match resp.upload_id {
             None => {
@@ -497,6 +556,7 @@ async fn send_file_multi(
         });
         cmur.upload_id = upload_id.clone();
 
+        debug!("Completing multipart upload of {} with upload_id {}", object_name, upload_id);
         match s3.complete_multipart_upload(cmur).await {
             Ok(_) => {
                 debug!("Upload to s3://{}/{} succeeded", bucket, object_name);
@@ -556,6 +616,8 @@ async fn send_file_part(
         error!("Unable to seek to position {} of {:?}: {}", start, path, e);
         return Err(e.into());
     }
+
+    debug!("Uploading {:?} byte range {} to {} with upload_id {:?}", path, start, end, upload_id);
 
     let file = file.take(size);
     let s3 = S3Client::new(Region::default());
@@ -788,6 +850,31 @@ fn evaluate_pattern_at(
     Ok(result.into_iter().collect())
 }
 
+/// Determine whether we're likely to be able to open a file
+#[cfg(unix)]
+fn likely_can_open_file(filename: &str) -> Result<(), Box<(dyn Error + 'static)>> {
+    access(filename, AccessFlags::R_OK)?;
+    let m = metadata(filename)?;
+    if m.is_dir() {
+        Err(Box::new(NixError::Sys(Errno::EISDIR)))
+    } else if m.file_type().is_socket() {
+        Err(Box::new(NixError::Sys(Errno::EOPNOTSUPP)))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(unix))]
+fn likely_can_open_file(filename: &str) -> Result<(), Box<(dyn Error + 'static)>> {
+    let m = metadata(filename)?;
+    if m.is_dir() {
+        Err(Box::new(BadFileTypeError{}))
+    } else {
+        Ok(())
+    }
+}
+
+
 #[cfg(test)]
 mod test {
     use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
@@ -881,3 +968,4 @@ mod test {
         assert!(crate::get_host_id_from_ethernet_ip().is_some());
     }
 }
+ 

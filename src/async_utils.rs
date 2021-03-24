@@ -68,6 +68,10 @@ where
     pub fn push(&self, future: Fut) -> () {
         self.f.push(future)
     }
+
+    pub fn len(&self) -> usize {
+        self.f.len()
+    }
 }
 
 impl<Fut> Stream for TaskQueue<Fut>

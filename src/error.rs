@@ -87,3 +87,19 @@ impl Display for InvalidS3URL {
 }
 
 impl Error for InvalidS3URL {}
+
+
+/// Error type for non-Unix platforms representing a bad file type
+#[cfg(not(unix))]
+#[derive(Debug)]
+pub(crate) struct BadFileTypeError {}
+
+#[cfg(not(unix))]
+impl Display for BadFileTypeError {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
+        write!(f, "Bad file type")
+    }
+}
+
+#[cfg(not(unix))]
+impl Error for BadFileTypeError {}
