@@ -1,7 +1,5 @@
 use reqwest;
-use std::{
-    time::Duration,
-};
+use std::time::Duration;
 
 macro_rules! metadata_url {
     ($path:literal) => {

@@ -88,7 +88,6 @@ impl Display for InvalidS3URL {
 
 impl Error for InvalidS3URL {}
 
-
 /// Error type for non-Unix platforms representing a bad file type
 #[cfg(not(unix))]
 #[derive(Debug)]

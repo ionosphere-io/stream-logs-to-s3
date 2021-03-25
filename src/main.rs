@@ -12,6 +12,7 @@ use std::{
     net::IpAddr,
     path::PathBuf,
     process::exit,
+    str::FromStr,
     time::Duration,
 };
 
@@ -28,28 +29,28 @@ use get_if_addrs::get_if_addrs;
 use gethostname::gethostname;
 use getopts::Options;
 use humantime::parse_duration;
-use log::{debug, info, error};
+use log::{debug, error, info};
 use rand::{thread_rng, RngCore};
 use rusoto_core::{ByteStream, Region};
 use rusoto_s3::{
     AbortMultipartUploadRequest, CompleteMultipartUploadRequest, CompletedMultipartUpload, CompletedPart,
-    CreateMultipartUploadRequest, PutObjectRequest, S3Client, UploadPartRequest, S3,
+    CreateMultipartUploadRequest, GetBucketLocationRequest, PutObjectRequest, S3Client, UploadPartRequest, S3,
 };
 use tempfile::{NamedTempFile, TempPath};
 use tokio::{
     self,
     fs::File,
     io::{stdin, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
-    runtime::{Builder as RuntimeBuilder},
+    runtime::Builder as RuntimeBuilder,
     select,
 };
 use tokio_util::io::ReaderStream;
 
 #[cfg(unix)]
 use nix::{
-    Error as NixError,
     errno::Errno,
-    unistd::{AccessFlags, access},
+    unistd::{access, AccessFlags},
+    Error as NixError,
 };
 
 mod async_utils;
@@ -216,7 +217,6 @@ acceptable to the byte_unit crate, e.g., \"123KiB\".",
         },
     };
 
-    debug!("About to get host id");
     let runtime = match RuntimeBuilder::new_current_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {
@@ -226,20 +226,73 @@ acceptable to the byte_unit crate, e.g., \"123KiB\".",
     };
 
     runtime.block_on(async {
-        let host_id = get_host_id().await;
+        debug!("Obtaining host id");
+        let host_id_future = get_host_id();
+
+        debug!("Getting bucket location");
+        let s3 = S3Client::new(Region::default());
+        let get_bucket_location_future = s3.get_bucket_location(GetBucketLocationRequest {
+            bucket: bucket.clone(),
+            expected_bucket_owner: None,
+        });
+
+        let host_id = host_id_future.await;
         debug!("Using host_id {:?}", host_id);
 
-        stderr().flush().unwrap();
-        match input_file {
-            Some(filename) => {
-                match File::open(filename.clone()).await {
-                    Ok(f) => 
-                        run(f, &host_id, max_size, max_duration, &temp_dir, &bucket, &object_name_pattern, compress).await.unwrap(),
-                    Err(e) => error!("Unable to open {:?}: {:?}", filename, e),
-                }
+        let bucket_region = match get_bucket_location_future.await {
+            Err(e) => {
+                error!("Unable to determine the location of S3 bucket {}: {:?}", bucket, e);
+                exit(1);
             }
-            None =>
-                run(stdin(), &host_id, max_size, max_duration, &temp_dir, &bucket, &object_name_pattern, compress).await.unwrap()
+            Ok(output) => match output.location_constraint {
+                None => Region::UsEast1,
+                Some(name) => {
+                    if name == "EU" {
+                        // Alias for eu-west-1
+                        Region::EuWest1
+                    } else {
+                        match Region::from_str(&name) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                error!("Bucket location constraint {:#?} cannot be decoded to a region: {:?}", name, e);
+                                exit(1);
+                            }
+                        }
+                    }
+                }
+            },
+        };
+
+        match input_file {
+            Some(filename) => match File::open(filename.clone()).await {
+                Ok(f) => run(
+                    f,
+                    &host_id,
+                    max_size,
+                    max_duration,
+                    &temp_dir,
+                    &bucket,
+                    bucket_region,
+                    &object_name_pattern,
+                    compress,
+                )
+                .await
+                .unwrap(),
+                Err(e) => error!("Unable to open {:?}: {:?}", filename, e),
+            },
+            None => run(
+                stdin(),
+                &host_id,
+                max_size,
+                max_duration,
+                &temp_dir,
+                &bucket,
+                bucket_region,
+                &object_name_pattern,
+                compress,
+            )
+            .await
+            .unwrap(),
         }
     });
 }
@@ -252,6 +305,7 @@ async fn run<R: AsyncRead>(
     max_duration: Duration,
     temp_dir: &PathBuf,
     bucket: &str,
+    bucket_region: Region,
     object_name_pattern: &str,
     compress: bool,
 ) -> io::Result<()> {
@@ -286,7 +340,7 @@ async fn run<R: AsyncRead>(
                     info!("Timeout hit; sending log file {:?} to S3", temp_path);
                     // We've hit the timeout limit. Send the file to S3.
                     match evaluate_pattern(object_name_pattern, host_id) {
-                        Ok(object_name) => send_futures.push(send_file(file, temp_path, host_id.to_string(), bucket.to_string(), object_name)),
+                        Ok(object_name) => send_futures.push(send_file(file, temp_path, host_id.to_string(), bucket.to_string(), bucket_region.clone(), object_name)),
                         Err(e) => error!("Unable to generate object name for S3: {}", e),
                     }
                     break;
@@ -342,7 +396,7 @@ async fn run<R: AsyncRead>(
                         // We need to flush to S3 -- either we're full or an issue occurred.
                         match evaluate_pattern(object_name_pattern, host_id) {
                             Ok(object_name) => {
-                                send_futures.push(send_file(file, temp_path, host_id.to_string(), bucket.to_string(), object_name));
+                                send_futures.push(send_file(file, temp_path, host_id.to_string(), bucket.to_string(), bucket_region.clone(), object_name));
                             }
                             Err(e) => error!("Unable to generate object name for S3: {}", e),
                         };
@@ -357,7 +411,8 @@ async fn run<R: AsyncRead>(
                     debug!("send_future: {:?}", result);
                     // One of the S3 jobs has completed.
                     match result {
-                        Some((path, object_name, result)) => debug!("File {:?} -> s3://{}/{}: {:?}", path, bucket, object_name, result),
+                        Some((path, object_name, result)) => debug!(
+                            "File {:?} -> s3://{}/{}: {:?}", path, bucket, object_name, result),
                         None => debug!("Busy wait on send_futures"),
                     }
                 }
@@ -368,7 +423,9 @@ async fn run<R: AsyncRead>(
     // Drain any upload tasks.
     while send_futures.len() > 0 {
         match send_futures.next().await {
-            Some((path, object_name, result)) => debug!("File {:?} -> s3://{}/{}: {:?}", path, bucket, object_name, result),
+            Some((path, object_name, result)) => {
+                debug!("File {:?} -> s3://{}/{}: {:?}", path, bucket, object_name, result)
+            }
             None => debug!("Busy wait on send_futures"),
         }
     }
@@ -383,9 +440,14 @@ async fn send_file(
     path: TempPath,
     host_id: String,
     bucket: String,
+    bucket_region: Region,
     object_name: String,
 ) -> (OsString, String, Result<(), SendFileError>) {
-    (path.as_os_str().to_os_string(), object_name.clone(), do_send_file(file, path, host_id, bucket, object_name).await)
+    (
+        path.as_os_str().to_os_string(),
+        object_name.clone(),
+        do_send_file(file, path, host_id, bucket, bucket_region, object_name).await,
+    )
 }
 
 /// Write a temporary file to S3.
@@ -395,6 +457,7 @@ async fn do_send_file(
     path: TempPath,
     host_id: String,
     bucket: String,
+    bucket_region: Region,
     object_name: String,
 ) -> Result<(), SendFileError> {
     // Stop writing to the file. If this is a compressed file, this will flush out any remaining bytes stored by the
@@ -428,10 +491,10 @@ async fn do_send_file(
     // Do we need to do a multi-part upload?
     if size <= MAX_PART_SIZE {
         // No, keep it simple.
-        send_file_single(file, size, path, host_id, bucket, object_name).await
+        send_file_single(file, size, path, host_id, bucket, bucket_region, object_name).await
     } else {
         // Yep -- do the complexity needed by S3 here.
-        send_file_multi(file, size, path, host_id, bucket, object_name).await
+        send_file_multi(file, size, path, host_id, bucket, bucket_region, object_name).await
     }
 }
 
@@ -442,9 +505,10 @@ async fn send_file_single(
     path: TempPath,
     host_id: String,
     bucket: String,
+    bucket_region: Region,
     object_name: String,
 ) -> Result<(), SendFileError> {
-    let s3 = S3Client::new(Region::default());
+    let s3 = S3Client::new(bucket_region);
 
     let mut por = PutObjectRequest::default();
     por.bucket = bucket.clone();
@@ -458,7 +522,7 @@ async fn send_file_single(
 
     let reader = ReaderStream::new(file);
     por.body = Some(ByteStream::new_with_size(reader, size as usize));
-    
+
     info!("Performing single upload for {:?} of size {:?}", path, size);
     match s3.put_object(por).await {
         Ok(_) => Ok(()),
@@ -476,9 +540,10 @@ async fn send_file_multi(
     path: TempPath,
     host_id: String,
     bucket: String,
+    bucket_region: Region,
     object_name: String,
 ) -> Result<(), SendFileError> {
-    let s3 = S3Client::new(Region::default());
+    let s3 = S3Client::new(bucket_region.clone());
     let mut cmur = CreateMultipartUploadRequest::default();
     cmur.bucket = bucket.clone();
     cmur.key = object_name.clone();
@@ -515,6 +580,7 @@ async fn send_file_multi(
         futures.push(send_file_part(
             os_path,
             bucket.clone(),
+            bucket_region.clone(),
             object_name.clone(),
             upload_id.clone(),
             part_number,
@@ -597,6 +663,7 @@ async fn send_file_multi(
 async fn send_file_part(
     path: OsString,
     bucket: String,
+    bucket_region: Region,
     object_name: String,
     upload_id: String,
     part_number: i64,
@@ -620,7 +687,7 @@ async fn send_file_part(
     debug!("Uploading {:?} byte range {} to {} with upload_id {:?}", path, start, end, upload_id);
 
     let file = file.take(size);
-    let s3 = S3Client::new(Region::default());
+    let s3 = S3Client::new(bucket_region);
     let mut upr = UploadPartRequest::default();
     upr.bucket = bucket.clone();
     upr.content_length = Some(size as i64);
@@ -869,12 +936,11 @@ fn likely_can_open_file(filename: &str) -> Result<(), Box<(dyn Error + 'static)>
 fn likely_can_open_file(filename: &str) -> Result<(), Box<(dyn Error + 'static)>> {
     let m = metadata(filename)?;
     if m.is_dir() {
-        Err(Box::new(BadFileTypeError{}))
+        Err(Box::new(BadFileTypeError {}))
     } else {
         Ok(())
     }
 }
-
 
 #[cfg(test)]
 mod test {
@@ -969,4 +1035,3 @@ mod test {
         assert!(crate::get_host_id_from_ethernet_ip().is_some());
     }
 }
- 
