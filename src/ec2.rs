@@ -23,7 +23,7 @@ const EC2_IMDSV2_TOKEN_TTL_VALUE: &str = "60";
 const EC2_IMDSV2_TOKEN_API: &str = metadata_url!("api/token");
 
 /// The URI path for obtainint the instance ID.
-const EC2_IMDS_INSTANCE_ID: &str = metadata_url!("metadata/instance-id");
+const EC2_IMDS_INSTANCE_ID: &str = metadata_url!("meta-data/instance-id");
 
 /// Return the EC2 instance id. This handles the case where we only have IMDSv2 available properly.
 pub(crate) async fn get_host_id_from_ec2_metadata() -> Option<String> {
