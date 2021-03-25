@@ -247,7 +247,10 @@ acceptable to the byte_unit crate, e.g., \"123KiB\".",
             Ok(output) => match output.location_constraint {
                 None => Region::UsEast1,
                 Some(name) => {
-                    if name == "EU" {
+                    if name == "" {
+                        // Alaias for us-east-1
+                        Region::UsEast1
+                    } else if name == "EU" {
                         // Alias for eu-west-1
                         Region::EuWest1
                     } else {
