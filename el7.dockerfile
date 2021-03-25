@@ -16,6 +16,10 @@ COPY src /stream-logs-to-s3/src
 WORKDIR /stream-logs-to-s3
 RUN cargo build --target x86_64-unknown-linux-gnu
 RUN cargo build --target x86_64-unknown-linux-gnu --release
-WORKDIR target
-RUN zip ../stream-logs-to-s3.zip x86_64-unknown-linux-gnu/debug/stream-logs-to-s3 x86_64-unknown-linux-gnu/release/stream-logs-to-s3
-WORKDIR ..
+WORKDIR /stream-logs-to-s3/target/x86_64-unknown-linux-gnu
+RUN VERSION=$(egrep '^version = ' ../../Cargo.toml | sed -E -e 's/[^"]+"([^"]+)"/\1/'); \
+cd debug; gzip < stream-logs-to-s3 > ../../../stream-logs-to-s3-${VERSION}-el7-debug.gz; \
+cd ../release; gzip < stream-logs-to-s3 > ../../../stream-logs-to-s3-${VERSION}-el7-release.gz
+WORKDIR /stream-logs-to-s3
+RUN VERSION=$(egrep '^version = ' Cargo.toml | sed -E -e 's/[^"]+"([^"]+)"/\1/'); \
+zip -0 stream-logs-to-s3-${VERSION}-el7.zip stream-logs-to-s3-${VERSION}-el7-debug.gz stream-logs-to-s3-${VERSION}-el7-release.gz

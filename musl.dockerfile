@@ -12,6 +12,10 @@ WORKDIR /stream-logs-to-s3
 RUN apk add --no-cache clang gcc musl-dev openssl-dev openssl-libs-static zip
 RUN cargo build --target x86_64-unknown-linux-musl
 RUN cargo build --target x86_64-unknown-linux-musl --release
-WORKDIR target
-RUN zip ../stream-logs-to-s3.zip x86_64-unknown-linux-musl/debug/stream-logs-to-s3 x86_64-unknown-linux-musl/release/stream-logs-to-s3
-WORKDIR ..
+WORKDIR /stream-logs-to-s3/target/x86_64-unknown-linux-musl
+RUN VERSION=$(egrep '^version = ' ../../Cargo.toml | sed -E -e 's/[^"]+"([^"]+)"/\1/'); \
+cd debug; gzip < stream-logs-to-s3 > ../../../stream-logs-to-s3-${VERSION}-musl-debug.gz; \
+cd ../release; gzip < stream-logs-to-s3 > ../../../stream-logs-to-s3-${VERSION}-musl-release.gz
+WORKDIR /stream-logs-to-s3
+RUN VERSION=$(egrep '^version = ' Cargo.toml | sed -E -e 's/[^"]+"([^"]+)"/\1/'); \
+zip -0 stream-logs-to-s3-${VERSION}-musl.zip stream-logs-to-s3-${VERSION}-musl-debug.gz stream-logs-to-s3-${VERSION}-musl-release.gz
