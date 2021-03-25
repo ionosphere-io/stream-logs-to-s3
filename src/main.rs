@@ -642,9 +642,10 @@ async fn send_file_part(
 /// Print usage information.
 fn print_usage<W: Write>(mut writer: W, program: &str, opts: Options) -> Result<(), io::Error> {
     let synopsis = format!(
-        "Usage: {} [options] s3://bucket/prefix/filename
-Buffer line-oriented logs and write them to S3. The destination can include
-the following template identifiers:
+        "Usage: {} [options] s3://bucket/prefix/path-template
+Buffer text logs and write them to S3. The path template can include
+the following variables. Timestamps are generated in the UTC timezone.
+
     {{host_id}}       The hostname, EC2 instance id, or ECS task id, or
                       IP address.
     {{year}}          The current year.

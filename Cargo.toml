@@ -3,6 +3,13 @@ name = "stream-logs-to-s3"
 version = "0.1.0"
 authors = ["David Cuthbert <dacut@kanga.org>"]
 edition = "2018"
+license = "MIT OR Apache-2.0"
+description = "Buffer text to S3, batching them up by size and/or time period. This is intended to be a replacement for rotatelogs on (e.g.) Apache HTTPD servers running in the cloud."
+readme = "README.md"
+homepage = "https://github.com/ionosphere-io/stream-logs-to-s3"
+repository = "https://github.com/ionosphere-io/stream-logs-to-s3.git"
+keywords = ["logging", "S3", "AWS", "log-streaming"]
+categories = ["command-line-utilities", "web-programming"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
