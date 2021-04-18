@@ -31,7 +31,11 @@ use getopts::Options;
 use humantime::parse_duration;
 use log::{debug, error, info};
 use rand::{thread_rng, RngCore};
-use rusoto_core::{ByteStream, Region};
+use rusoto_core::{
+    ByteStream, Client, Region,
+    request::HttpClient
+};
+use rusoto_credential::{AutoRefreshingProvider, ChainProvider};
 use rusoto_s3::{
     AbortMultipartUploadRequest, CompleteMultipartUploadRequest, CompletedMultipartUpload, CompletedPart,
     CreateMultipartUploadRequest, GetBucketLocationRequest, PutObjectRequest, S3Client, UploadPartRequest, S3,
@@ -511,7 +515,7 @@ async fn send_file_single(
     bucket_region: Region,
     object_name: String,
 ) -> Result<(), SendFileError> {
-    let s3 = S3Client::new(bucket_region);
+    let s3 = S3Client::new_with_client(get_rusoto_client(), bucket_region.clone());
 
     let mut por = PutObjectRequest::default();
     por.bucket = bucket.clone();
@@ -546,7 +550,7 @@ async fn send_file_multi(
     bucket_region: Region,
     object_name: String,
 ) -> Result<(), SendFileError> {
-    let s3 = S3Client::new(bucket_region.clone());
+    let s3 = S3Client::new_with_client(get_rusoto_client(), bucket_region.clone());
     let mut cmur = CreateMultipartUploadRequest::default();
     cmur.bucket = bucket.clone();
     cmur.key = object_name.clone();
@@ -690,7 +694,7 @@ async fn send_file_part(
     debug!("Uploading {:?} byte range {} to {} with upload_id {:?}", path, start, end, upload_id);
 
     let file = file.take(size);
-    let s3 = S3Client::new(bucket_region);
+    let s3 = S3Client::new_with_client(get_rusoto_client(), bucket_region.clone());
     let mut upr = UploadPartRequest::default();
     upr.bucket = bucket.clone();
     upr.content_length = Some(size as i64);
@@ -943,6 +947,14 @@ fn likely_can_open_file(filename: &str) -> Result<(), Box<(dyn Error + 'static)>
     } else {
         Ok(())
     }
+}
+
+/// Create a Rusoto client that auto-refreshes credentials when needed.
+fn get_rusoto_client() -> Client {
+    let chain_provider = ChainProvider::new();
+    let auto_refresh_provider = AutoRefreshingProvider::new(chain_provider).expect("failed to create AutoRefreshingProvider");
+    let dispatcher = HttpClient::new().expect("failed to create request HttpClient requewst dispatcher");
+    Client::new_with(auto_refresh_provider, dispatcher)
 }
 
 #[cfg(test)]

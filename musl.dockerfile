@@ -4,6 +4,7 @@ RUN ls -la
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs > rustup.sh
 RUN /bin/sh rustup.sh --default-host x86_64-unknown-linux-musl --default-toolchain nightly -y
 ENV PATH=/root/.cargo/bin:$PATH
+RUN cargo install rls || true
 
 RUN mkdir /stream-logs-to-s3
 COPY ["Cargo.toml", "Cargo.lock", "/stream-logs-to-s3/"]
