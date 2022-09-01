@@ -584,7 +584,7 @@ async fn send_file_multi(
     while start < size {
         let end = min(start + MAX_PART_SIZE, size);
         let os_path = path.as_os_str().to_os_string();
-        futures.push(send_file_part(
+        futures.push_back(send_file_part(
             os_path,
             bucket.clone(),
             bucket_region.clone(),
@@ -786,7 +786,7 @@ fn get_host_id_from_ethernet_ip() -> Option<String> {
                     IpAddr::V6(ipv6) => {
                         if !ipv6.is_unspecified()
                             && !ipv6.is_loopback()
-                            && !ipv6.is_unicast_link_local_strict()
+                            && !ipv6.is_unicast_link_local()
                             && !ipv6.is_multicast()
                         {
                             return Some(ipv6.to_string());
