@@ -65,7 +65,7 @@ where
         }
     }
 
-    pub fn push(&self, future: Fut) -> () {
+    pub fn push(&self, future: Fut) {
         self.f.push(future)
     }
 

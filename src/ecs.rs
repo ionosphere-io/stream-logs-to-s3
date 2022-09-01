@@ -1,7 +1,6 @@
 use chrono::{DateTime, Utc};
 use lazy_static::lazy_static;
 use regex::Regex;
-use reqwest;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::{

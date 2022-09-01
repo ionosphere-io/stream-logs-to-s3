@@ -1,4 +1,3 @@
-use reqwest;
 use std::time::Duration;
 
 macro_rules! metadata_url {

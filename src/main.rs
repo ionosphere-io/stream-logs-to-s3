@@ -1,3 +1,4 @@
+#![warn(clippy::all)]
 #![feature(ip)]
 
 use std::{
@@ -20,10 +21,8 @@ use std::{
 use std::os::unix::fs::FileTypeExt;
 
 use async_compression::{tokio::write::GzipEncoder, Level};
-use base32;
 use byte_unit::Byte;
 use chrono::{DateTime, Datelike, Timelike, Utc};
-use env_logger;
 use futures::stream::{FuturesOrdered, StreamExt};
 use get_if_addrs::get_if_addrs;
 use gethostname::gethostname;
@@ -181,7 +180,7 @@ acceptable to the byte_unit crate, e.g., \"123KiB\".",
         Some(dir) => dir.into(),
     };
 
-    if matches.free.len() == 0 {
+    if matches.free.is_empty() {
         eprintln!("Missing S3 write destination.");
         eprintln!();
         print_usage(stderr(), &program, opts).unwrap();
@@ -248,7 +247,7 @@ acceptable to the byte_unit crate, e.g., \"123KiB\".",
             Ok(output) => match output.location_constraint {
                 None => Region::UsEast1,
                 Some(name) => {
-                    if name == "" {
+                    if name.is_empty() {
                         // Alaias for us-east-1
                         Region::UsEast1
                     } else if name == "EU" {
@@ -302,6 +301,7 @@ acceptable to the byte_unit crate, e.g., \"123KiB\".",
 }
 
 /// The main loop of the program. Under normal conditions, this returns only when the input stream is closed.
+#[allow(clippy::too_many_arguments)]
 async fn run<R: AsyncRead>(
     reader: R,
     host_id: &str,
@@ -514,18 +514,19 @@ async fn send_file_single(
 ) -> Result<(), SendFileError> {
     let s3 = S3Client::new_with_client(get_rusoto_client(), bucket_region.clone());
 
-    let mut por = PutObjectRequest::default();
-    por.bucket = bucket.clone();
-    por.content_length = Some(size as i64);
-    por.key = object_name.clone();
-
-    // XXX -- allow encryption algorithm to be specified.
-    por.server_side_encryption = Some("AES256".to_string());
-    // XXX -- allow tagging to be specified.
-    por.tagging = Some(format!("HostId={}", host_id));
-
     let reader = ReaderStream::new(file);
-    por.body = Some(ByteStream::new_with_size(reader, size as usize));
+
+    let por = PutObjectRequest {
+        body: Some(ByteStream::new_with_size(reader, size as usize)),
+        bucket: bucket.clone(),
+        content_length: Some(size as i64),
+        key: object_name.clone(),
+        // XXX -- allow encryption algorithm to be specified.
+        server_side_encryption: Some("AES256".to_string()),
+        // XXX -- allow tagging to be specified.
+        tagging: Some(format!("HostId={}", host_id)),
+        ..Default::default()
+    };
 
     info!("Performing single upload for {:?} of size {:?}", path, size);
     match s3.put_object(por).await {
@@ -548,14 +549,15 @@ async fn send_file_multi(
     object_name: String,
 ) -> Result<(), SendFileError> {
     let s3 = S3Client::new_with_client(get_rusoto_client(), bucket_region.clone());
-    let mut cmur = CreateMultipartUploadRequest::default();
-    cmur.bucket = bucket.clone();
-    cmur.key = object_name.clone();
-
-    // XXX -- allow encryption algorithm to be specified.
-    cmur.server_side_encryption = Some("AES256".to_string());
-    // XXX -- allow tagging to be specified.
-    cmur.tagging = Some(format!("HostId={}", host_id));
+    let cmur = CreateMultipartUploadRequest {
+        bucket: bucket.clone(),
+        key: object_name.clone(),
+        // XXX -- allow encryption algorithm to be specified.
+        server_side_encryption: Some("AES256".to_string()),
+        // XXX -- allow tagging to be specified.
+        tagging: Some(format!("HostId={}", host_id)),
+        ..Default::default()
+    };
 
     info!("Performing multipart upload for {:?} of size {}", path, size);
     let upload_id = match s3.create_multipart_upload(cmur).await {
@@ -611,20 +613,22 @@ async fn send_file_multi(
                     part_number: Some(part_number),
                     e_tag: Some(e_tag),
                 }),
-                Err(e) => saved_error = Some(e.into()),
+                Err(e) => saved_error = Some(e),
             },
         }
     }
 
     if saved_error.is_none() {
         // All parts uploaded successfully. Close out the upload.
-        let mut cmur = CompleteMultipartUploadRequest::default();
-        cmur.bucket = bucket.clone();
-        cmur.key = object_name.clone();
-        cmur.multipart_upload = Some(CompletedMultipartUpload {
-            parts: Some(completed_parts),
-        });
-        cmur.upload_id = upload_id.clone();
+        let cmur = CompleteMultipartUploadRequest {
+            bucket: bucket.clone(),
+            key: object_name.clone(),
+            multipart_upload: Some(CompletedMultipartUpload {
+                parts: Some(completed_parts),
+            }),
+            upload_id: upload_id.clone(),
+            ..Default::default()
+        };
 
         debug!("Completing multipart upload of {} with upload_id {}", object_name, upload_id);
         match s3.complete_multipart_upload(cmur).await {
@@ -646,10 +650,12 @@ async fn send_file_multi(
     // Something happened with at least one part or the CompleteMultipartUpload API. Abort the upload so we are not
     // continually charged for the incompleted upload (which, at this point, won't succeed).
     error!("At least one upload failed; aborting multipart upload");
-    let mut amur = AbortMultipartUploadRequest::default();
-    amur.bucket = bucket.clone();
-    amur.key = object_name.clone();
-    amur.upload_id = upload_id.clone();
+    let amur = AbortMultipartUploadRequest {
+        bucket: bucket.clone(),
+        key: object_name.clone(),
+        upload_id: upload_id.clone(),
+        ..Default::default()
+    };
 
     match s3.abort_multipart_upload(amur).await {
         Ok(_) => Err(saved_error.unwrap()),
@@ -664,6 +670,7 @@ async fn send_file_multi(
 }
 
 /// Asynchronous task for uploading a part of a file.
+#[allow(clippy::too_many_arguments)]
 async fn send_file_part(
     path: OsString,
     bucket: String,
@@ -692,15 +699,18 @@ async fn send_file_part(
 
     let file = file.take(size);
     let s3 = S3Client::new_with_client(get_rusoto_client(), bucket_region.clone());
-    let mut upr = UploadPartRequest::default();
-    upr.bucket = bucket.clone();
-    upr.content_length = Some(size as i64);
-    upr.key = object_name.clone();
-    upr.part_number = part_number;
-    upr.upload_id = upload_id;
 
     let reader = ReaderStream::new(file);
-    upr.body = Some(ByteStream::new_with_size(reader, size as usize));
+    let upr = UploadPartRequest {
+        body: Some(ByteStream::new_with_size(reader, size as usize)),
+        bucket: bucket.clone(),
+        content_length: Some(size as i64),
+        key: object_name.clone(),
+        part_number,
+        upload_id,
+        ..Default::default()
+    };
+
     match s3.upload_part(upr).await {
         Ok(result) => Ok((part_number, result.e_tag.unwrap())),
         Err(e) => {
@@ -804,7 +814,7 @@ fn parse_s3_url(s3_url: &str) -> Result<(String, String), InvalidS3URL> {
     }
 
     let bucket_and_prefix = s3_url.split_at(S3_PROTO_PREFIX.len()).1;
-    let mut parts_iter = bucket_and_prefix.splitn(2, "/");
+    let mut parts_iter = bucket_and_prefix.splitn(2, '/');
     let bucket = match parts_iter.next() {
         Some(s) => s,
         None => {
@@ -812,14 +822,10 @@ fn parse_s3_url(s3_url: &str) -> Result<(String, String), InvalidS3URL> {
         }
     };
 
-    let object_name_pattern = match parts_iter.next() {
-        Some(s) => s,
-        None => "",
-    };
-
-    if bucket.len() == 0 {
+    let object_name_pattern = parts_iter.next().unwrap_or("");
+    if bucket.is_empty() {
         Err(InvalidS3URL::InvalidURLFormat("bucket/path cannot be empty".to_string(), s3_url.to_string()))
-    } else if object_name_pattern.len() == 0 {
+    } else if object_name_pattern.is_empty() {
         Err(InvalidS3URL::InvalidURLFormat("path cannot be empty".to_string(), s3_url.to_string()))
     } else {
         Ok((bucket.to_string(), object_name_pattern.to_string()))
@@ -863,12 +869,7 @@ fn evaluate_pattern_at(
     variables.insert("second", format!("{:02}", now.second()));
     variables.insert("unique", unique);
 
-    loop {
-        let c = match p_iter.next() {
-            Some(c) => c,
-            None => break,
-        };
-
+    while let Some(c) = p_iter.next() {
         // Is this the start of a brace?
         if c == '{' {
             let mut c = match p_iter.next() {
