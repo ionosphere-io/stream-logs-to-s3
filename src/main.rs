@@ -31,10 +31,7 @@ use getopts::Options;
 use humantime::parse_duration;
 use log::{debug, error, info};
 use rand::{thread_rng, RngCore};
-use rusoto_core::{
-    ByteStream, Client, Region,
-    request::HttpClient
-};
+use rusoto_core::{request::HttpClient, ByteStream, Client, Region};
 use rusoto_credential::{AutoRefreshingProvider, ChainProvider};
 use rusoto_s3::{
     AbortMultipartUploadRequest, CompleteMultipartUploadRequest, CompletedMultipartUpload, CompletedPart,
@@ -952,7 +949,8 @@ fn likely_can_open_file(filename: &str) -> Result<(), Box<(dyn Error + 'static)>
 /// Create a Rusoto client that auto-refreshes credentials when needed.
 fn get_rusoto_client() -> Client {
     let chain_provider = ChainProvider::new();
-    let auto_refresh_provider = AutoRefreshingProvider::new(chain_provider).expect("failed to create AutoRefreshingProvider");
+    let auto_refresh_provider =
+        AutoRefreshingProvider::new(chain_provider).expect("failed to create AutoRefreshingProvider");
     let dispatcher = HttpClient::new().expect("failed to create request HttpClient requewst dispatcher");
     Client::new_with(auto_refresh_provider, dispatcher)
 }
