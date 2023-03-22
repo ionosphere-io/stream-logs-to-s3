@@ -1,16 +1,18 @@
-use lazy_static::lazy_static;
-use regex::Regex;
-use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
-use std::{
-    collections::HashMap,
-    env::var,
-    error::Error,
-    fmt::{Display, Formatter, Result as FormatResult},
-    net::Ipv4Addr,
-    time::Duration,
+use {
+    lazy_static::lazy_static,
+    regex::Regex,
+    serde::{Deserialize, Serialize},
+    serde_json::{Map, Value},
+    std::{
+        collections::HashMap,
+        env::var,
+        error::Error,
+        fmt::{Display, Formatter, Result as FormatResult},
+        net::Ipv4Addr,
+        time::Duration,
+    },
+    time::OffsetDateTime,
 };
-use time::OffsetDateTime;
 
 const ECS_V4_ENDPOINT_VAR: &str = "ECS_CONTAINER_METADATA_URI_V4";
 const ECS_V3_ENDPOINT_VAR: &str = "ECS_CONTAINER_METADATA_URI";

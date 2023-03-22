@@ -1,9 +1,11 @@
-use rusoto_core::RusotoError;
-use rusoto_s3::{CompleteMultipartUploadError, CreateMultipartUploadError, PutObjectError, UploadPartError};
-use std::{
-    error::Error,
-    fmt::{Debug, Display, Formatter, Result as FmtResult},
-    io::Error as IOError,
+use {
+    rusoto_core::RusotoError,
+    rusoto_s3::{CompleteMultipartUploadError, CreateMultipartUploadError, PutObjectError, UploadPartError},
+    std::{
+        error::Error,
+        fmt::{Debug, Display, Formatter, Result as FmtResult},
+        io::Error as IOError,
+    },
 };
 
 /// The error type returned by the send-file-to-S3 asynchronous jobs.

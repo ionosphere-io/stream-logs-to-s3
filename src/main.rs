@@ -20,31 +20,33 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
 
-use async_compression::{tokio::write::GzipEncoder, Level};
-use byte_unit::Byte;
-use futures::stream::{FuturesOrdered, StreamExt};
-use get_if_addrs::get_if_addrs;
-use gethostname::gethostname;
-use getopts::Options;
-use humantime::parse_duration;
-use log::{debug, error, info};
-use rand::{thread_rng, RngCore};
-use rusoto_core::{request::HttpClient, ByteStream, Client, Region};
-use rusoto_credential::{AutoRefreshingProvider, ChainProvider};
-use rusoto_s3::{
-    AbortMultipartUploadRequest, CompleteMultipartUploadRequest, CompletedMultipartUpload, CompletedPart,
-    CreateMultipartUploadRequest, GetBucketLocationRequest, PutObjectRequest, S3Client, UploadPartRequest, S3,
+use {
+    async_compression::{tokio::write::GzipEncoder, Level},
+    byte_unit::Byte,
+    futures::stream::{FuturesOrdered, StreamExt},
+    get_if_addrs::get_if_addrs,
+    gethostname::gethostname,
+    getopts::Options,
+    humantime::parse_duration,
+    log::{debug, error, info},
+    rand::{thread_rng, RngCore},
+    rusoto_core::{request::HttpClient, ByteStream, Client, Region},
+    rusoto_credential::{AutoRefreshingProvider, ChainProvider},
+    rusoto_s3::{
+        AbortMultipartUploadRequest, CompleteMultipartUploadRequest, CompletedMultipartUpload, CompletedPart,
+        CreateMultipartUploadRequest, GetBucketLocationRequest, PutObjectRequest, S3Client, UploadPartRequest, S3,
+    },
+    tempfile::{NamedTempFile, TempPath},
+    time::OffsetDateTime,
+    tokio::{
+        self,
+        fs::File,
+        io::{stdin, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
+        runtime::Builder as RuntimeBuilder,
+        select,
+    },
+    tokio_util::io::ReaderStream,
 };
-use tempfile::{NamedTempFile, TempPath};
-use time::OffsetDateTime;
-use tokio::{
-    self,
-    fs::File,
-    io::{stdin, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
-    runtime::Builder as RuntimeBuilder,
-    select,
-};
-use tokio_util::io::ReaderStream;
 
 #[cfg(unix)]
 use nix::{
@@ -57,10 +59,14 @@ mod async_utils;
 mod ec2;
 mod ecs;
 mod error;
-use crate::async_utils::{MaybeCompressedFile, MaybeTimeout, TaskQueue};
-use crate::error::{InvalidS3URL, SendFileError};
-use ec2::get_host_id_from_ec2_metadata;
-use ecs::get_host_id_from_ecs_metadata;
+use {
+    crate::{
+        async_utils::{MaybeCompressedFile, MaybeTimeout, TaskQueue},
+        error::{InvalidS3URL, SendFileError},
+    },
+    ec2::get_host_id_from_ec2_metadata,
+    ecs::get_host_id_from_ecs_metadata,
+};
 
 #[cfg(not(unix))]
 use crate::error::BadFileTypeError;
