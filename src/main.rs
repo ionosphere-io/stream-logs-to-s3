@@ -22,7 +22,6 @@ use std::os::unix::fs::FileTypeExt;
 
 use async_compression::{tokio::write::GzipEncoder, Level};
 use byte_unit::Byte;
-use chrono::{DateTime, Datelike, Timelike, Utc};
 use futures::stream::{FuturesOrdered, StreamExt};
 use get_if_addrs::get_if_addrs;
 use gethostname::gethostname;
@@ -37,6 +36,7 @@ use rusoto_s3::{
     CreateMultipartUploadRequest, GetBucketLocationRequest, PutObjectRequest, S3Client, UploadPartRequest, S3,
 };
 use tempfile::{NamedTempFile, TempPath};
+use time::OffsetDateTime;
 use tokio::{
     self,
     fs::File,
@@ -838,7 +838,7 @@ fn parse_s3_url(s3_url: &str) -> Result<(String, String), InvalidS3URL> {
 /// Ideally, we would use a library that provides the runtime equivalent of Rust's `format!` macro, but the
 /// `runtime_fmt`
 fn evaluate_pattern(pattern: &str, host_id: &str) -> Result<String, InvalidS3URL> {
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let mut unique: [u8; 15] = [0; 15];
     thread_rng().fill_bytes(&mut unique);
     evaluate_pattern_at(pattern, host_id, now, unique)
@@ -847,7 +847,7 @@ fn evaluate_pattern(pattern: &str, host_id: &str) -> Result<String, InvalidS3URL
 fn evaluate_pattern_at(
     pattern: &str,
     host_id: &str,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
     unique: [u8; 15],
 ) -> Result<String, InvalidS3URL> {
     let mut result = Vec::<char>::with_capacity(pattern.len() * 2);
@@ -862,7 +862,7 @@ fn evaluate_pattern_at(
 
     variables.insert("host_id", host_id.to_string());
     variables.insert("year", format!("{:04}", now.year()));
-    variables.insert("month", format!("{:02}", now.month()));
+    variables.insert("month", format!("{:02}", now.month() as u8));
     variables.insert("day", format!("{:02}", now.day()));
     variables.insert("hour", format!("{:02}", now.hour()));
     variables.insert("minute", format!("{:02}", now.minute()));
@@ -958,15 +958,13 @@ fn get_rusoto_client() -> Client {
 
 #[cfg(test)]
 mod test {
-    use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+    use time::macros::datetime;
 
     #[test]
     fn test_evaulate_at() {
         let host_id = "localhost";
-        let now = DateTime::from_utc(
-            NaiveDateTime::new(NaiveDate::from_ymd(2020, 5, 4), NaiveTime::from_hms(15, 20, 10)),
-            Utc,
-        );
+        let now = datetime!(2020-05-04 15:20:10 UTC);
+
         // JPLJPLJPLJPLJPLJPLJPLJPL when base32 encoded
         let unique = [0x4b, 0xd6, 0x97, 0xad, 0x2f, 0x5a, 0x5e, 0xb4, 0xbd, 0x69, 0x7a, 0xd2, 0xf5, 0xa5, 0xeb];
         assert_eq!(

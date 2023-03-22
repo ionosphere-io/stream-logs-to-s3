@@ -1,4 +1,3 @@
-use chrono::{DateTime, Utc};
 use lazy_static::lazy_static;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -11,6 +10,7 @@ use std::{
     net::Ipv4Addr,
     time::Duration,
 };
+use time::OffsetDateTime;
 
 const ECS_V4_ENDPOINT_VAR: &str = "ECS_CONTAINER_METADATA_URI_V4";
 const ECS_V3_ENDPOINT_VAR: &str = "ECS_CONTAINER_METADATA_URI";
@@ -125,11 +125,11 @@ struct EcsTaskMetadata {
 
     /// The timestamp for when the first container image pull began.
     #[serde(rename = "PullStartedAt")]
-    pub pull_started_at: Option<DateTime<Utc>>,
+    pub pull_started_at: Option<OffsetDateTime>,
 
     /// The timestamp for when the last container image pull finished.
     #[serde(rename = "PullStoppedAt")]
-    pub pull_stopped_at: Option<DateTime<Utc>>,
+    pub pull_stopped_at: Option<OffsetDateTime>,
 
     /// The Availability Zone the task is in.
     /// Note: The Availability Zone metadata is only available for Fargate tasks using platform version 1.4 or later.
@@ -149,7 +149,7 @@ struct EcsTaskMetadata {
     /// The time stamp for when the tasks DesiredStatus moved to STOPPED. This occurs when an essential container moves
     /// to STOPPED.
     #[serde(rename = "ExecutionStoppedAt")]
-    pub execution_stopped_at: Option<DateTime<Utc>>,
+    pub execution_stopped_at: Option<OffsetDateTime>,
 
     #[serde(rename = "TaskTags")]
     pub task_tags: Option<Map<String, Value>>,
@@ -237,15 +237,15 @@ struct EcsContainerMetadata {
     /// The time stamp for when the container was created. This parameter is omitted if the container has not been
     /// created yet.
     #[serde(rename = "CreatedAt")]
-    pub created_at: Option<DateTime<Utc>>,
+    pub created_at: Option<OffsetDateTime>,
 
     /// The time stamp for when the container started. This parameter is omitted if the container has not started yet.
     #[serde(rename = "StartedAt")]
-    pub started_at: Option<DateTime<Utc>>,
+    pub started_at: Option<OffsetDateTime>,
 
     /// The time stamp for when the container stopped. This parameter is omitted if the container has not stopped yet.    
     #[serde(rename = "FinishedAt")]
-    pub finished_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<OffsetDateTime>,
 
     /// The type of the container. Containers that are specified in your task definition are of type NORMAL. You can
     /// ignore other container types, which are used for internal task resource provisioning by the Amazon ECS
