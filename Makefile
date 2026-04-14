@@ -1,6 +1,6 @@
 VERSION := $(shell egrep '^version = ' Cargo.toml | sed -E -e 's/[^"]+"([^"]+)"/\1/')
 SRCS = src/*.rs
-OS_SUFFIXES = amzn2 el7 musl macos
+OS_SUFFIXES = amzn2023 musl macos
 ARCH_SUFFIXES = aarch64 x86_64
 ZIP_FILE_BASES = $(foreach os,${OS_SUFFIXES},stream-logs-to-s3-${VERSION}-${os}-)
 ZIP_FILES = $(foreach arch,${ARCH_SUFFIXES},$(addsuffix ${arch}.zip,${ZIP_FILE_BASES}))

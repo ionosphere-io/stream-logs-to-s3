@@ -153,8 +153,8 @@ impl AsyncWrite for MaybeCompressedFile {
 
     fn is_write_vectored(&self) -> bool {
         match self {
-            Self::Gzip(ref g) => g.is_write_vectored(),
-            Self::Uncompressed(ref u) => u.is_write_vectored(),
+            Self::Gzip(g) => g.is_write_vectored(),
+            Self::Uncompressed(u) => u.is_write_vectored(),
         }
     }
 }

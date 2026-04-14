@@ -1,40 +1,46 @@
 #![warn(clippy::all)]
-#![feature(ip)]
 
-use std::{
-    cmp::min,
-    collections::HashMap,
-    env,
-    error::Error,
-    ffi::OsString,
-    fs::metadata,
-    io::{self, stderr, stdout, SeekFrom, Write},
-    iter::Extend,
-    net::IpAddr,
-    path::PathBuf,
-    process::exit,
-    str::FromStr,
-    time::Duration,
-};
-
-#[cfg(unix)]
-use std::os::unix::fs::FileTypeExt;
+mod async_utils;
+mod ec2;
+mod ecs;
+mod error;
 
 use {
+    crate::{
+        async_utils::{MaybeCompressedFile, MaybeTimeout, TaskQueue},
+        error::{InvalidS3URL, SendFileError},
+    },
     async_compression::{tokio::write::GzipEncoder, Level},
     byte_unit::Byte,
+    ec2::get_host_id_from_ec2_metadata,
+    ecs::get_host_id_from_ecs_metadata,
     futures::stream::{FuturesOrdered, StreamExt},
     get_if_addrs::get_if_addrs,
     gethostname::gethostname,
     getopts::Options,
     humantime::parse_duration,
     log::{debug, error, info},
-    rand::{thread_rng, RngCore},
+    rand::{rng, RngCore},
     rusoto_core::{request::HttpClient, ByteStream, Client, Region},
     rusoto_credential::{AutoRefreshingProvider, ChainProvider},
     rusoto_s3::{
         AbortMultipartUploadRequest, CompleteMultipartUploadRequest, CompletedMultipartUpload, CompletedPart,
         CreateMultipartUploadRequest, GetBucketLocationRequest, PutObjectRequest, S3Client, UploadPartRequest, S3,
+    },
+    std::{
+        cmp::min,
+        collections::HashMap,
+        env,
+        error::Error,
+        ffi::OsString,
+        fs::metadata,
+        io::{self, stderr, stdout, SeekFrom, Write},
+        iter::Extend,
+        net::IpAddr,
+        path::PathBuf,
+        process::exit,
+        str::FromStr,
+        time::Duration,
     },
     tempfile::{NamedTempFile, TempPath},
     time::OffsetDateTime,
@@ -49,23 +55,13 @@ use {
 };
 
 #[cfg(unix)]
-use nix::{
-    errno::Errno,
-    unistd::{access, AccessFlags},
-    Error as NixError,
-};
-
-mod async_utils;
-mod ec2;
-mod ecs;
-mod error;
 use {
-    crate::{
-        async_utils::{MaybeCompressedFile, MaybeTimeout, TaskQueue},
-        error::{InvalidS3URL, SendFileError},
+    nix::{
+        errno::Errno,
+        unistd::{access, AccessFlags},
+        Error as NixError,
     },
-    ec2::get_host_id_from_ec2_metadata,
-    ecs::get_host_id_from_ecs_metadata,
+    std::os::unix::fs::FileTypeExt,
 };
 
 #[cfg(not(unix))]
@@ -846,7 +842,7 @@ fn parse_s3_url(s3_url: &str) -> Result<(String, String), InvalidS3URL> {
 fn evaluate_pattern(pattern: &str, host_id: &str) -> Result<String, InvalidS3URL> {
     let now = OffsetDateTime::now_utc();
     let mut unique: [u8; 15] = [0; 15];
-    thread_rng().fill_bytes(&mut unique);
+    rng().fill_bytes(&mut unique);
     evaluate_pattern_at(pattern, host_id, now, unique)
 }
 
@@ -931,7 +927,7 @@ fn evaluate_pattern_at(
 
 /// Determine whether we're likely to be able to open a file
 #[cfg(unix)]
-fn likely_can_open_file(filename: &str) -> Result<(), Box<(dyn Error + 'static)>> {
+fn likely_can_open_file(filename: &str) -> Result<(), Box<dyn Error + 'static>> {
     access(filename, AccessFlags::R_OK)?;
     let m = metadata(filename)?;
     if m.is_dir() {
