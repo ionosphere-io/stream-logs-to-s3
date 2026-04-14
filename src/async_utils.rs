@@ -1,22 +1,21 @@
-use std::{
-    future::Future,
-    io::{Error as IOError, IoSlice},
-    pin::Pin,
-    task::{Context, Poll},
-    time::Duration,
-};
-
-use async_compression::tokio::write::GzipEncoder;
-
-use futures::{
-    future::{pending, Pending},
-    stream::{FuturesUnordered, Stream},
-};
-
-use tokio::{
-    fs::File as TokioFile,
-    io::AsyncWrite,
-    time::{sleep, Sleep},
+use {
+    async_compression::tokio::write::GzipEncoder,
+    futures::{
+        future::{Pending, pending},
+        stream::{FuturesUnordered, Stream},
+    },
+    std::{
+        future::Future,
+        io::{Error as IOError, IoSlice},
+        pin::Pin,
+        task::{Context, Poll},
+        time::Duration,
+    },
+    tokio::{
+        fs::File as TokioFile,
+        io::AsyncWrite,
+        time::{Sleep, sleep},
+    },
 };
 
 /// A union that allows us to either sleep or wait forever.

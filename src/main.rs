@@ -10,7 +10,7 @@ use {
         async_utils::{MaybeCompressedFile, MaybeTimeout, TaskQueue},
         error::{InvalidS3URL, SendFileError},
     },
-    async_compression::{tokio::write::GzipEncoder, Level},
+    async_compression::{Level, tokio::write::GzipEncoder},
     byte_unit::Byte,
     ec2::get_host_id_from_ec2_metadata,
     ecs::get_host_id_from_ecs_metadata,
@@ -20,12 +20,12 @@ use {
     getopts::Options,
     humantime::parse_duration,
     log::{debug, error, info},
-    rand::{rng, RngCore},
-    rusoto_core::{request::HttpClient, ByteStream, Client, Region},
+    rand::{Rng as _, rng},
+    rusoto_core::{ByteStream, Client, Region, request::HttpClient},
     rusoto_credential::{AutoRefreshingProvider, ChainProvider},
     rusoto_s3::{
         AbortMultipartUploadRequest, CompleteMultipartUploadRequest, CompletedMultipartUpload, CompletedPart,
-        CreateMultipartUploadRequest, GetBucketLocationRequest, PutObjectRequest, S3Client, UploadPartRequest, S3,
+        CreateMultipartUploadRequest, GetBucketLocationRequest, PutObjectRequest, S3, S3Client, UploadPartRequest,
     },
     std::{
         cmp::min,
@@ -34,7 +34,7 @@ use {
         error::Error,
         ffi::OsString,
         fs::metadata,
-        io::{self, stderr, stdout, SeekFrom, Write},
+        io::{self, SeekFrom, Write, stderr, stdout},
         iter::Extend,
         net::IpAddr,
         path::PathBuf,
@@ -47,7 +47,7 @@ use {
     tokio::{
         self,
         fs::File,
-        io::{stdin, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
+        io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, stdin},
         runtime::Builder as RuntimeBuilder,
         select,
     },
@@ -58,8 +58,7 @@ use {
 use {
     nix::{
         errno::Errno,
-        unistd::{access, AccessFlags},
-        Error as NixError,
+        unistd::{AccessFlags, access},
     },
     std::os::unix::fs::FileTypeExt,
 };
@@ -71,10 +70,10 @@ use crate::error::BadFileTypeError;
 const DEFAULT_DURATION: Duration = Duration::from_secs(3600);
 
 /// The default maximum size of a log to buffer (1 MiB).
-const DEFAULT_SIZE: Byte = Byte::from_bytes(1 << 20);
+const DEFAULT_SIZE: Byte = Byte::from_u64(1 << 20);
 
 /// The maximum size of an S3 object (5 TiB).
-const S3_MAXIMUM_SIZE: Byte = Byte::from_bytes(5 << 30);
+const S3_MAXIMUM_SIZE: Byte = Byte::from_u64(5 << 40);
 
 /// The maximum size of an S3 object part upload in a multipart upload. We should eventually make this tunable.
 /// Currently fixed at 10 MiB.
@@ -175,7 +174,7 @@ acceptable to the byte_unit crate, e.g., \"123KiB\".",
         exit(2);
     }
 
-    let max_size: u64 = max_size.get_bytes() as u64;
+    let max_size: u64 = max_size.into();
 
     let temp_dir: PathBuf = match matches.opt_str("t") {
         None => env::temp_dir(),
@@ -820,7 +819,7 @@ fn parse_s3_url(s3_url: &str) -> Result<(String, String), InvalidS3URL> {
     let bucket = match parts_iter.next() {
         Some(s) => s,
         None => {
-            return Err(InvalidS3URL::InvalidURLFormat("bucket/path cannot be empty".to_string(), s3_url.to_string()))
+            return Err(InvalidS3URL::InvalidURLFormat("bucket/path cannot be empty".to_string(), s3_url.to_string()));
         }
     };
 
@@ -856,7 +855,7 @@ fn evaluate_pattern_at(
     let mut p_iter = pattern.chars();
     let mut variables = HashMap::new();
     let unique = base32::encode(
-        base32::Alphabet::RFC4648 {
+        base32::Alphabet::Rfc4648 {
             padding: false,
         },
         &unique,
@@ -901,7 +900,7 @@ fn evaluate_pattern_at(
                         return Err(InvalidS3URL::InvalidTemplateSyntax(format!(
                             "Unknown template variable '{}'",
                             var_name
-                        )))
+                        )));
                     }
                 };
                 result.extend(repl.chars());
@@ -931,9 +930,9 @@ fn likely_can_open_file(filename: &str) -> Result<(), Box<dyn Error + 'static>> 
     access(filename, AccessFlags::R_OK)?;
     let m = metadata(filename)?;
     if m.is_dir() {
-        Err(Box::new(NixError::Sys(Errno::EISDIR)))
+        Err(Box::new(Errno::EISDIR))
     } else if m.file_type().is_socket() {
-        Err(Box::new(NixError::Sys(Errno::EOPNOTSUPP)))
+        Err(Box::new(Errno::EOPNOTSUPP))
     } else {
         Ok(())
     }
