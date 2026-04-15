@@ -1,0 +1,54 @@
+name: Rust
+
+on:
+  [push, pull_request]
+env:
+  CARGO_INCREMENTAL: '0'
+  RUSTFLAGS: '-Ccodegen-units=1 -Cinstrument-coverage -Copt-level=0'
+  RUSTDOCFLAGS: '-Ccodegen-units=1 -Cinstrument-coverage -Copt-level=0'
+  AWS_REGION: us-west-2
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+permissions:
+  id-token: write   # This is required for requesting the JWT
+  contents: read    # This is required for actions/checkout
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v6
+    - id: aws_creds
+      name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v6.0.0
+      with:
+        role-to-assume: arn:aws:iam::557925715019:role/github-scratchstack-actions
+        role-session-name: github-stream-logs-to-s3-actions
+        aws-region: ${{ env.AWS_REGION }}
+    - name: Install Rust nightly
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: nightly
+        components: "clippy,rustfmt"
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2.9.1
+      with:
+        shared-key: stream-logs-to-s3-ci-${{ github.head_ref || github.ref_name }}
+    - name: Instal cargo-llvm-cov
+      run: cargo install cargo-llvm-cov
+    - name: Run formatting check.
+      run: cargo fmt --check
+    - name: Run Clippy check.
+      run: cargo clippy -- -Dwarnings
+    - name: Run tests and gather coverage data
+      env:
+        RUST_LOG: debug
+      run: cargo llvm-cov --tests --html --output-dir coverage-report
+    - name: Upload coverage report to AWS
+      run: aws s3 sync coverage-report/html s3://${{ secrets.COVERAGE_S3_BUCKET }}/coverage/stream-logs-to-s3/${{ github.run_number }} --no-progress
+    - name: Build documentation
+      run: cargo doc --no-deps
+    - name: Upload documentation to AWS
+      run: |
+        cp index.html target/doc/index.html
+        aws s3 sync target/doc s3://${{ secrets.COVERAGE_S3_BUCKET }}/docs/stream-logs-to-s3/${{ github.run_number }} --no-progress
