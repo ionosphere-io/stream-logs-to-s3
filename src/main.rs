@@ -16,29 +16,18 @@ use {
     aws_sdk_s3::types::{BucketLocationConstraint, CompletedMultipartUpload, CompletedPart, ServerSideEncryption},
     aws_smithy_types::byte_stream::{FsBuilder, Length},
     byte_unit::Byte,
+    clap::Parser,
     ec2::get_host_id_from_ec2_metadata,
     ecs::get_host_id_from_ecs_metadata,
     futures::stream::{FuturesOrdered, StreamExt},
     get_if_addrs::get_if_addrs,
     gethostname::gethostname,
-    getopts::Options,
     humantime::parse_duration,
     log::{debug, error, info},
     rand::{Rng as _, rng},
     std::{
-        cmp::min,
-        collections::HashMap,
-        env,
-        error::Error,
-        ffi::OsString,
-        fs::metadata,
-        io::{self, SeekFrom, Write, stderr, stdout},
-        iter::Extend,
-        net::IpAddr,
-        path::PathBuf,
-        process::exit,
-        str::FromStr,
-        time::Duration,
+        cmp::min, collections::HashMap, error::Error, ffi::OsString, fs::metadata, io::SeekFrom, iter::Extend,
+        net::IpAddr, path::PathBuf, process::exit, str::FromStr, time::Duration,
     },
     tempfile::{NamedTempFile, TempPath},
     time::OffsetDateTime,
@@ -66,12 +55,6 @@ use crate::error::BadFileTypeError;
 /// The size of reads to use when ingesting data from the input stream.
 const READ_BUF_SIZE: usize = 65536;
 
-/// The default duration to buffer logs for (1 hour).
-const DEFAULT_DURATION: Duration = Duration::from_secs(3600);
-
-/// The default maximum size of a log to buffer (1 MiB).
-const DEFAULT_SIZE: Byte = Byte::from_u64(1 << 20);
-
 /// The maximum size of an S3 object (5 TiB).
 const S3_MAXIMUM_SIZE: Byte = Byte::from_u64(5 << 40);
 
@@ -91,125 +74,99 @@ const S3_PROTO_PREFIX: &str = "s3://";
 /// How often we log size information.
 const SIZE_REPORTING_INTERVAL: u64 = 10 << 20;
 
+/// Buffer text logs and write them to S3.
+///
+/// The path template can include the following variables. Timestamps are generated in the UTC timezone.
+///
+/// * {{host_id}} - The hostname, EC2 instance id, or ECS task id, or IP address.\n
+/// * {{year}} - The current year.\n
+/// * {{month}} - The current month as a 2-digit string.\n
+/// * {{day}} - The current day as a 2-digit string.\n
+/// * {{hour}} - The current hour as a 2-digit string.\n
+/// * {{minute}} - The current minute as a 2-digit string.\n
+/// * {{second}} - The current second as a 2-digit string.\n
+/// * {{unique}} - A unique identifier to ensure filename uniqueness.
+///
+/// To include a raw '{{' or '}}' in the output, double it: '{{{{' / '}}}}'.
+#[derive(Debug, Parser)]
+#[command(
+    version,
+    about = "Buffer text logs and write them to S3.",
+    long_about = r#"Buffer text logs and write them to S3.
+
+The path template can include the following variables. Timestamps are generated in the UTC timezone.
+
+* {host_id} - The hostname, EC2 instance id, or ECS task id, or IP address.
+* {year} - The current year.
+* {month} - The current month as a 2-digit string.
+* {day} - The current day as a 2-digit string.
+* {hour} - The current hour as a 2-digit string.
+* {minute} - The current minute as a 2-digit string.
+* {second} - The current second as a 2-digit string.
+* {unique} - A unique identifier to ensure filename uniqueness.
+
+To include a raw '{' or '}' in the output, double it: '{{' / '}}'.
+"#
+)]
+struct Cli {
+    /// Maximum duration to buffer before flushing to S3. The duration is any
+    /// string acceptable to the humantime crate, e.g., "1hour 12min 5s".
+    #[arg(short = 'd', long, default_value = "1h", value_parser = parse_duration)]
+    pub duration: Duration,
+
+    /// Temporary directory to use for buffering. Defaults to the TMPDIR
+    /// environment variable or /tmp if that is not set.
+    #[arg(short = 't', long, env = "TMPDIR", default_value = "/tmp")]
+    pub tempdir: String,
+
+    /// Maximum size to buffer before flushing to S3. The size is any string
+    /// acceptable to the byte_unit crate, e.g., "123KiB".
+    #[arg(short = 's', long, default_value = "1MiB", value_parser = Byte::from_str)]
+    pub size: Byte,
+
+    /// Read input from the specified file (should be a FIFO) instead of stdin; this is usually for testing.
+    #[arg(short = 'i', long)]
+    pub input: Option<String>,
+
+    /// Compress output using gzip.
+    #[arg(short = 'z', long)]
+    pub gzip: bool,
+
+    /// The S3 URL to write to, in the format `s3://bucket/path-template`.
+    #[arg()]
+    pub destination: String,
+}
+
 /// Program entrypoint. Parse options and, if they seem reasonable, fire up the main routine (run).
 fn main() {
     env_logger::init();
-    let args: Vec<String> = env::args().collect();
-    let program = args[0].clone();
-    let mut opts = Options::new();
+    let args = Cli::parse();
 
-    opts.optopt(
-        "d",
-        "duration",
-        "Maximum duration to buffer before flushing to S3; defaults to 1h. The duration is any string acceptable to \
-the humantime crate, e.g., \"1hour 12min 5s\".",
-        "#<unit>",
-    );
-
-    opts.optopt(
-        "t",
-        "tempdir",
-        "Temporary directory to use for buffering; defaults to $TMPDIR (if set), \
-\"/tmp\" otherwise.",
-        "directory",
-    );
-
-    opts.optopt(
-        "s",
-        "size",
-        "Maximum size to buffer before flushing to S3; defaults to 1MiB. The size is any string \
-acceptable to the byte_unit crate, e.g., \"123KiB\".",
-        "#<unit>>",
-    );
-
-    opts.optopt(
-        "i",
-        "input",
-        "Read input from the specified file (should be a FIFO) instead of stdin; this is usually for testing.",
-        "<filename>",
-    );
-
-    opts.optflag("z", "gzip", "Compress output using gzip.");
-    opts.optflag("h", "help", "Show this usage information");
-
-    let matches = match opts.parse(&args[1..]) {
-        Ok(m) => m,
-        Err(f) => panic!("{f}"),
-    };
-
-    if matches.opt_present("h") {
-        print_usage(stdout(), &program, opts).unwrap();
-        return;
-    }
-
-    let compress = matches.opt_present("z");
-
-    let max_duration = match matches.opt_str("d") {
-        None => DEFAULT_DURATION,
-        Some(duration_str) => match parse_duration(&duration_str) {
-            Ok(duration) => duration,
-            Err(e) => {
-                eprintln!("Unable to parse {duration_str:#} as a valid duration: {e:#}");
-                eprintln!();
-                print_usage(stderr(), &program, opts).unwrap();
-                exit(2);
-            }
-        },
-    };
-
-    let max_size = match matches.opt_str("s") {
-        None => DEFAULT_SIZE,
-        Some(size_str) => match Byte::from_str(&size_str) {
-            Ok(size) => size,
-            Err(e) => {
-                eprintln!("Unable to parse {size_str:#} as a valid size: {e:#}");
-                eprintln!();
-                print_usage(stderr(), &program, opts).unwrap();
-                exit(2);
-            }
-        },
-    };
-
+    let compress = args.gzip;
+    let max_duration = args.duration;
+    let max_size = args.size;
     if max_size > S3_MAXIMUM_SIZE {
         eprintln!("Maximum size cannot be greater than {S3_MAXIMUM_SIZE:?}");
-        eprintln!();
-        print_usage(stderr(), &program, opts).unwrap();
         exit(2);
     }
-
     let max_size: u64 = max_size.into();
+    let temp_dir: PathBuf = args.tempdir.into();
+    let destination = args.destination;
 
-    let temp_dir: PathBuf = match matches.opt_str("t") {
-        None => env::temp_dir(),
-        Some(dir) => dir.into(),
-    };
-
-    if matches.free.is_empty() {
+    if destination.is_empty() {
         eprintln!("Missing S3 write destination.");
-        eprintln!();
-        print_usage(stderr(), &program, opts).unwrap();
         exit(2);
     }
 
-    if matches.free.len() > 1 {
-        eprintln!("Unknown argument {:#}", matches.free[1]);
-        eprintln!();
-        print_usage(stderr(), &program, opts).unwrap();
-        exit(2);
-    }
-
-    let destination = &matches.free[0];
-
-    let (bucket, object_name_pattern) = match parse_s3_url(destination) {
+    let (bucket, object_name_pattern) = match parse_s3_url(&destination) {
         Ok((bucket, onp)) => (bucket, onp),
         Err(_) => {
             eprintln!("Invalid S3 URL: {destination}");
-            print_usage(stderr(), &program, opts).unwrap();
             exit(2);
         }
     };
 
-    let input_file = match matches.opt_str("i") {
+    let input_file = match args.input {
         None => None,
         // Don't attempt to open the file; if it's a FIFO, we will stall until a byte is available.
         Some(filename) => match likely_can_open_file(&filename) {
@@ -693,28 +650,6 @@ async fn send_file_part(
             Err(e.into())
         }
     }
-}
-
-/// Print usage information.
-fn print_usage<W: Write>(mut writer: W, program: &str, opts: Options) -> Result<(), io::Error> {
-    let synopsis = format!(
-        "Usage: {program} [options] s3://bucket/prefix/path-template
-Buffer text logs and write them to S3. The path template can include
-the following variables. Timestamps are generated in the UTC timezone.
-
-    {{host_id}}       The hostname, EC2 instance id, or ECS task id, or
-                      IP address.
-    {{year}}          The current year.
-    {{month}}         The current month as a 2-digit string.
-    {{day}}           The current day as a 2-digit string.
-    {{hour}}          The current hour as a 2-digit string.
-    {{minute}}        The current minute as a 2-digit string.
-    {{second}}        The current second as a 2-digit string.
-    {{unique}}        A unique identifier to ensure filename uniqueness.
-To include a raw '{{' or '}}' in the output, double it: '{{{{' / '}}}}'.
-"
-    );
-    write!(writer, "{}", opts.usage(&synopsis))
 }
 
 /// Return an identifier for this host.

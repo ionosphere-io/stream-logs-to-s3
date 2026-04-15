@@ -21,12 +21,12 @@ aws-sdk-s3 = "^1.129"
 aws-smithy-types = { version = "^1.4", features = [ "rt-tokio" ] }
 base32 = "^0.5"
 byte-unit = "^5.2"
+clap = { version = "^4.0", features = [ "derive", "env", "wrap_help" ] }
 env_logger = "^0.11"
 flate2 = { version = "^1.1" }
 futures = "^0.3"
 gethostname = "^1.1"
 get_if_addrs = "^0.5"
-getopts = "^0.2"
 humantime = "^2.3"
 lazy_static = "^1.5"
 log = "^0.4"
