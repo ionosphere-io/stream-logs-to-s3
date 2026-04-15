@@ -8,9 +8,13 @@ mod error;
 use {
     crate::{
         async_utils::{MaybeCompressedFile, MaybeTimeout, TaskQueue},
-        error::{InvalidS3URL, SendFileError},
+        error::InvalidS3URL,
     },
+    anyhow::{Result as AnyResult, bail},
     async_compression::{Level, tokio::write::GzipEncoder},
+    aws_config::Region,
+    aws_sdk_s3::types::{BucketLocationConstraint, CompletedMultipartUpload, CompletedPart, ServerSideEncryption},
+    aws_smithy_types::byte_stream::{FsBuilder, Length},
     byte_unit::Byte,
     ec2::get_host_id_from_ec2_metadata,
     ecs::get_host_id_from_ecs_metadata,
@@ -21,12 +25,6 @@ use {
     humantime::parse_duration,
     log::{debug, error, info},
     rand::{Rng as _, rng},
-    rusoto_core::{ByteStream, Client, Region, request::HttpClient},
-    rusoto_credential::{AutoRefreshingProvider, ChainProvider},
-    rusoto_s3::{
-        AbortMultipartUploadRequest, CompleteMultipartUploadRequest, CompletedMultipartUpload, CompletedPart,
-        CreateMultipartUploadRequest, GetBucketLocationRequest, PutObjectRequest, S3, S3Client, UploadPartRequest,
-    },
     std::{
         cmp::min,
         collections::HashMap,
@@ -51,7 +49,6 @@ use {
         runtime::Builder as RuntimeBuilder,
         select,
     },
-    tokio_util::io::ReaderStream,
 };
 
 #[cfg(unix)]
@@ -66,6 +63,9 @@ use {
 #[cfg(not(unix))]
 use crate::error::BadFileTypeError;
 
+/// The size of reads to use when ingesting data from the input stream.
+const READ_BUF_SIZE: usize = 65536;
+
 /// The default duration to buffer logs for (1 hour).
 const DEFAULT_DURATION: Duration = Duration::from_secs(3600);
 
@@ -78,6 +78,12 @@ const S3_MAXIMUM_SIZE: Byte = Byte::from_u64(5 << 40);
 /// The maximum size of an S3 object part upload in a multipart upload. We should eventually make this tunable.
 /// Currently fixed at 10 MiB.
 const MAX_PART_SIZE: u64 = 10 << 20;
+
+/// Constant for the AWS region eu-west-1
+const REGION_EU_WEST_1: Region = Region::from_static("eu-west-1");
+
+/// Constant for the AWS region us-east-1
+const REGION_US_EAST_1: Region = Region::from_static("us-east-1");
 
 /// The prefix for S3 URLs.
 const S3_PROTO_PREFIX: &str = "s3://";
@@ -128,7 +134,7 @@ acceptable to the byte_unit crate, e.g., \"123KiB\".",
 
     let matches = match opts.parse(&args[1..]) {
         Ok(m) => m,
-        Err(f) => panic!("{}", f),
+        Err(f) => panic!("{f}"),
     };
 
     if matches.opt_present("h") {
@@ -141,12 +147,9 @@ acceptable to the byte_unit crate, e.g., \"123KiB\".",
     let max_duration = match matches.opt_str("d") {
         None => DEFAULT_DURATION,
         Some(duration_str) => match parse_duration(&duration_str) {
-            Ok(duration) => {
-                eprintln!("Using duration {:?}", duration);
-                duration
-            }
+            Ok(duration) => duration,
             Err(e) => {
-                eprintln!("Unable to parse {:#} as a valid duration: {:#}", duration_str, e);
+                eprintln!("Unable to parse {duration_str:#} as a valid duration: {e:#}");
                 eprintln!();
                 print_usage(stderr(), &program, opts).unwrap();
                 exit(2);
@@ -159,7 +162,7 @@ acceptable to the byte_unit crate, e.g., \"123KiB\".",
         Some(size_str) => match Byte::from_str(&size_str) {
             Ok(size) => size,
             Err(e) => {
-                eprintln!("Unable to parse {:#} as a valid size: {:#}", size_str, e);
+                eprintln!("Unable to parse {size_str:#} as a valid size: {e:#}");
                 eprintln!();
                 print_usage(stderr(), &program, opts).unwrap();
                 exit(2);
@@ -168,7 +171,7 @@ acceptable to the byte_unit crate, e.g., \"123KiB\".",
     };
 
     if max_size > S3_MAXIMUM_SIZE {
-        eprintln!("Maximum size cannot be greater than {:?}", S3_MAXIMUM_SIZE);
+        eprintln!("Maximum size cannot be greater than {S3_MAXIMUM_SIZE:?}");
         eprintln!();
         print_usage(stderr(), &program, opts).unwrap();
         exit(2);
@@ -200,7 +203,7 @@ acceptable to the byte_unit crate, e.g., \"123KiB\".",
     let (bucket, object_name_pattern) = match parse_s3_url(destination) {
         Ok((bucket, onp)) => (bucket, onp),
         Err(_) => {
-            eprintln!("Invalid S3 URL: {}", destination);
+            eprintln!("Invalid S3 URL: {destination}");
             print_usage(stderr(), &program, opts).unwrap();
             exit(2);
         }
@@ -212,7 +215,7 @@ acceptable to the byte_unit crate, e.g., \"123KiB\".",
         Some(filename) => match likely_can_open_file(&filename) {
             Ok(()) => Some(filename),
             Err(e) => {
-                eprintln!("Unable to open {:?}: {:?}", filename, e);
+                eprintln!("Unable to open {filename:?}: {e:?}");
                 exit(1);
             }
         },
@@ -221,49 +224,31 @@ acceptable to the byte_unit crate, e.g., \"123KiB\".",
     let runtime = match RuntimeBuilder::new_current_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {
-            error!("Unable to build Tokio runtime: {:?}", e);
+            error!("Unable to build Tokio runtime: {e}");
             exit(100);
         }
     };
 
     runtime.block_on(async {
-        debug!("Obtaining host id");
-        let host_id_future = get_host_id();
+        let host_id = get_host_id().await;
+        debug!("Using host_id {host_id:?}");
 
         debug!("Getting bucket location");
-        let s3 = S3Client::new(Region::default());
-        let get_bucket_location_future = s3.get_bucket_location(GetBucketLocationRequest {
-            bucket: bucket.clone(),
-            expected_bucket_owner: None,
-        });
+        let config = aws_config::load_from_env().await;
+        let s3 = aws_sdk_s3::Client::new(&config);
 
-        let host_id = host_id_future.await;
-        debug!("Using host_id {:?}", host_id);
-
-        let bucket_region = match get_bucket_location_future.await {
+        let bucket_loc_result = s3.get_bucket_location().bucket(bucket.clone()).send().await;
+        let bucket_region = match bucket_loc_result {
             Err(e) => {
-                error!("Unable to determine the location of S3 bucket {}: {:?}", bucket, e);
+                error!("Unable to determine the location of S3 bucket {bucket}: {e:?}");
                 exit(1);
             }
-            Ok(output) => match output.location_constraint {
-                None => Region::UsEast1,
-                Some(name) => {
-                    if name.is_empty() {
-                        // Alaias for us-east-1
-                        Region::UsEast1
-                    } else if name == "EU" {
-                        // Alias for eu-west-1
-                        Region::EuWest1
-                    } else {
-                        match Region::from_str(&name) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                error!("Bucket location constraint {:#?} cannot be decoded to a region: {:?}", name, e);
-                                exit(1);
-                            }
-                        }
-                    }
-                }
+            Ok(output) => match output.location_constraint() {
+                // No location constraint = us-east-1
+                None => REGION_US_EAST_1,
+                // EU = eu-west-1
+                Some(BucketLocationConstraint::Eu) => REGION_EU_WEST_1,
+                Some(loc) => Region::new(loc.as_str().to_string()),
             },
         };
 
@@ -282,7 +267,7 @@ acceptable to the byte_unit crate, e.g., \"123KiB\".",
                 )
                 .await
                 .unwrap(),
-                Err(e) => error!("Unable to open {:?}: {:?}", filename, e),
+                Err(e) => error!("Unable to open {filename:?}: {e:?}"),
             },
             None => run(
                 stdin(),
@@ -313,20 +298,20 @@ async fn run<R: AsyncRead>(
     bucket_region: Region,
     object_name_pattern: &str,
     compress: bool,
-) -> io::Result<()> {
-    let mut reader = Box::pin(BufReader::with_capacity(65536, reader));
+) -> AnyResult<()> {
+    let mut reader = Box::pin(BufReader::with_capacity(READ_BUF_SIZE, reader));
     let mut send_futures = TaskQueue::new();
-    info!("Loop starting with max_size {:?} and max_duration {:?}", max_size, max_duration);
+    info!("Loop starting with max_size {max_size:?} and max_duration {max_duration:?}");
 
     'outer: loop {
         let mut current_size: u64 = 0;
         let mut last_reported_size: u64 = 0;
-        let mut buf: [u8; 65536] = [0; 65536];
+        let mut buf: [u8; READ_BUF_SIZE] = [0; READ_BUF_SIZE];
 
         // Create a named temp file for recording data. We need to reopen this file for multipart uploads since
         // Rust doesn't let us dup() a file handle (yet).
         let (std_file, temp_path) = NamedTempFile::new_in(temp_dir)?.into_parts();
-        debug!("Opened log file {:?}", temp_path);
+        debug!("Opened log file {temp_path:?}");
 
         // Don't start the timer until the first byte is read. We initialize it here with a future that will never
         // complete.
@@ -342,11 +327,11 @@ async fn run<R: AsyncRead>(
         loop {
             select! {
                 _ = &mut timeout => {
-                    info!("Timeout hit; sending log file {:?} to S3", temp_path);
+                    info!("Timeout hit; sending log file {temp_path:?} to S3");
                     // We've hit the timeout limit. Send the file to S3.
                     match evaluate_pattern(object_name_pattern, host_id) {
                         Ok(object_name) => send_futures.push(send_file(file, temp_path, host_id.to_string(), bucket.to_string(), bucket_region.clone(), object_name)),
-                        Err(e) => error!("Unable to generate object name for S3: {}", e),
+                        Err(e) => error!("Unable to generate object name for S3: {e}"),
                     }
                     break;
                 }
@@ -366,7 +351,7 @@ async fn run<R: AsyncRead>(
                                     if current_size == 0 {
                                         // First byte written. Start the timer.
                                         timeout = MaybeTimeout::sleep(max_duration);
-                                        debug!("First byte written; started timer for {:?}", max_duration);
+                                        debug!("First byte written; started timer for {max_duration:?}");
                                     }
 
                                     // Ideally, we'd like to record the compressed size of the file, but there isn't
@@ -375,7 +360,7 @@ async fn run<R: AsyncRead>(
                                     current_size += n_read as u64;
 
                                     if current_size > last_reported_size + SIZE_REPORTING_INTERVAL {
-                                        debug!("Current file size is {:?}", current_size);
+                                        debug!("Current file size is {current_size:?}");
                                         last_reported_size = current_size;
                                     }
 
@@ -383,7 +368,7 @@ async fn run<R: AsyncRead>(
                                 }
                                 Err(e) => {
                                     // Yikes! We've failed to write to the temp file -- data loss has occurred.
-                                    error!("Failed to write {:?} bytes to {:?}: {:?}", n_read, temp_path, e);
+                                    error!("Failed to write {n_read:?} bytes to {temp_path:?}: {e:?}");
                                     error!("Forcing flush of file to S3");
                                     (true, false)
                                 }
@@ -391,19 +376,19 @@ async fn run<R: AsyncRead>(
                         }
                         Err(e) => {
                             // Incoming stream has shut down.
-                            info!("Incoming stream has shut down: {:?}", e);
+                            info!("Incoming stream has shut down: {e:?}");
                             (true, true)
                         }
                     };
 
                     if flush_required {
-                        info!("Size limit hit (or stream shutdown); sending log file {:?} to S3", temp_path);
+                        info!("Size limit hit (or stream shutdown); sending log file {temp_path:?} to S3");
                         // We need to flush to S3 -- either we're full or an issue occurred.
                         match evaluate_pattern(object_name_pattern, host_id) {
                             Ok(object_name) => {
                                 send_futures.push(send_file(file, temp_path, host_id.to_string(), bucket.to_string(), bucket_region.clone(), object_name));
                             }
-                            Err(e) => error!("Unable to generate object name for S3: {}", e),
+                            Err(e) => error!("Unable to generate object name for S3: {e}"),
                         };
                         if bad_reader {
                             break 'outer;
@@ -413,11 +398,11 @@ async fn run<R: AsyncRead>(
                 }
 
                 result = send_futures.next() => {
-                    debug!("send_future: {:?}", result);
+                    debug!("send_future: {result:?}");
                     // One of the S3 jobs has completed.
                     match result {
                         Some((path, object_name, result)) => debug!(
-                            "File {:?} -> s3://{}/{}: {:?}", path, bucket, object_name, result),
+                            "File {path:?} -> s3://{bucket}/{object_name}: {result:?}"),
                         None => debug!("Busy wait on send_futures"),
                     }
                 }
@@ -429,7 +414,7 @@ async fn run<R: AsyncRead>(
     while send_futures.len() > 0 {
         match send_futures.next().await {
             Some((path, object_name, result)) => {
-                debug!("File {:?} -> s3://{}/{}: {:?}", path, bucket, object_name, result)
+                debug!("File {path:?} -> s3://{bucket}/{object_name}: {result:?}");
             }
             None => debug!("Busy wait on send_futures"),
         }
@@ -447,7 +432,7 @@ async fn send_file(
     bucket: String,
     bucket_region: Region,
     object_name: String,
-) -> (OsString, String, Result<(), SendFileError>) {
+) -> (OsString, String, AnyResult<()>) {
     (
         path.as_os_str().to_os_string(),
         object_name.clone(),
@@ -464,7 +449,7 @@ async fn do_send_file(
     bucket: String,
     bucket_region: Region,
     object_name: String,
-) -> Result<(), SendFileError> {
+) -> AnyResult<()> {
     // Stop writing to the file. If this is a compressed file, this will flush out any remaining bytes stored by the
     // compression encoder.
     file.shutdown().await?;
@@ -479,7 +464,7 @@ async fn do_send_file(
     let size = match file.seek(SeekFrom::End(0)).await {
         Ok(size) => size,
         Err(e) => {
-            error!("Unable to seek to end-of-file on {:?}: {:?}", path, e);
+            error!("Unable to seek to end-of-file on {path:?}: {e:?}");
             return Err(e.into());
         }
     };
@@ -488,7 +473,7 @@ async fn do_send_file(
     match file.seek(SeekFrom::Start(0)).await {
         Ok(_) => (),
         Err(e) => {
-            error!("Unable to seek to start-of-file on {:?}: {:?}", path, e);
+            error!("Unable to seek to start-of-file on {path:?}: {e:?}");
             return Err(e.into());
         }
     }
@@ -512,28 +497,28 @@ async fn send_file_single(
     bucket: String,
     bucket_region: Region,
     object_name: String,
-) -> Result<(), SendFileError> {
-    let s3 = S3Client::new_with_client(get_rusoto_client(), bucket_region.clone());
+) -> AnyResult<()> {
+    let config = aws_config::load_from_env().await.to_builder().region(bucket_region.clone()).build();
+    let s3 = aws_sdk_s3::Client::new(&config);
+    let byte_stream = FsBuilder::new().file(file).length(Length::Exact(size)).build().await?;
 
-    let reader = ReaderStream::new(file);
-
-    let por = PutObjectRequest {
-        body: Some(ByteStream::new_with_size(reader, size as usize)),
-        bucket: bucket.clone(),
-        content_length: Some(size as i64),
-        key: object_name.clone(),
+    info!("Performing single upload for {path:?} of size {size:?}");
+    let result = s3.put_object()
+        .bucket(bucket.clone())
+        .body(byte_stream)
+        .content_length(size as i64)
+        .key(object_name.clone())
         // XXX -- allow encryption algorithm to be specified.
-        server_side_encryption: Some("AES256".to_string()),
+        .server_side_encryption(ServerSideEncryption::Aes256)
         // XXX -- allow tagging to be specified.
-        tagging: Some(format!("HostId={}", host_id)),
-        ..Default::default()
-    };
+        .tagging(format!("HostId={host_id}"))
+        .send()
+        .await;
 
-    info!("Performing single upload for {:?} of size {:?}", path, size);
-    match s3.put_object(por).await {
+    match result {
         Ok(_) => Ok(()),
         Err(e) => {
-            error!("Failed to write to s3://{}/{}: {:?}", bucket, object_name, e);
+            error!("Failed to write to s3://{bucket}/{object_name}: {e:?}");
             Err(e.into())
         }
     }
@@ -548,36 +533,40 @@ async fn send_file_multi(
     bucket: String,
     bucket_region: Region,
     object_name: String,
-) -> Result<(), SendFileError> {
-    let s3 = S3Client::new_with_client(get_rusoto_client(), bucket_region.clone());
-    let cmur = CreateMultipartUploadRequest {
-        bucket: bucket.clone(),
-        key: object_name.clone(),
-        // XXX -- allow encryption algorithm to be specified.
-        server_side_encryption: Some("AES256".to_string()),
-        // XXX -- allow tagging to be specified.
-        tagging: Some(format!("HostId={}", host_id)),
-        ..Default::default()
-    };
+) -> AnyResult<()> {
+    let config = aws_config::load_from_env().await.to_builder().region(bucket_region.clone()).build();
+    let s3 = aws_sdk_s3::Client::new(&config);
 
-    info!("Performing multipart upload for {:?} of size {}", path, size);
-    let upload_id = match s3.create_multipart_upload(cmur).await {
-        Ok(resp) => match resp.upload_id {
-            None => {
-                // This should NEVER happen.
-                error!("No upload-id returned by s3:CreateMultipartUpload for s3://{}/{}", bucket, object_name);
-                return Err(SendFileError::NoUploadPartId);
+    info!("Performing multipart upload for {path:?} of size {size}");
+    let result = s3.create_multipart_upload()
+        .bucket(bucket.clone())
+        .key(object_name.clone())
+        // XXX -- allow encryption algorithm to be specified.
+        .server_side_encryption(ServerSideEncryption::Aes256)
+        // XXX -- allow tagging to be specified.
+        .tagging(format!("HostId={host_id}"))
+        .send()
+        .await;
+
+    let upload_id = match result {
+        Ok(resp) => {
+            match resp.upload_id {
+                Some(upload_id) => upload_id,
+                None => {
+                    // This should never happen
+                    error!("No upload-id returned by s3:CreateMultipartUpload for s3://{bucket}/{object_name}");
+                    bail!("No upload-id returned by s3:CreateMultipartUpload for s3://{bucket}/{object_name}");
+                }
             }
-            Some(upload_id) => upload_id,
-        },
+        }
         Err(e) => {
-            error!("Unable to start multipart upload for s3://{}/{}: {:?}", bucket, object_name, e);
+            error!("Unable to start multipart upload for s3://{bucket}/{object_name}: {e:?}");
             return Err(e.into());
         }
     };
 
     let mut start = 0;
-    let mut part_number: i64 = 1; // Part numbers start at 1.
+    let mut part_number = 1; // Part numbers start at 1.
     let mut futures = FuturesOrdered::new();
 
     // Create a future for each part we need to upload.
@@ -603,17 +592,17 @@ async fn send_file_multi(
     let mut completed_parts = Vec::with_capacity((part_number - 1) as usize);
 
     // The error saved in case one of the multipart uploads failed.
-    let mut saved_error: Option<SendFileError> = None;
+    let mut saved_error = None;
 
     // Wait until all of the futures complete.
     loop {
         match futures.next().await {
             None => break,
             Some(result) => match result {
-                Ok((part_number, e_tag)) => completed_parts.push(CompletedPart {
-                    part_number: Some(part_number),
-                    e_tag: Some(e_tag),
-                }),
+                Ok((part_number, e_tag)) => {
+                    let cp = CompletedPart::builder().part_number(part_number).e_tag(e_tag).build();
+                    completed_parts.push(cp);
+                }
                 Err(e) => saved_error = Some(e),
             },
         }
@@ -621,53 +610,50 @@ async fn send_file_multi(
 
     if saved_error.is_none() {
         // All parts uploaded successfully. Close out the upload.
-        let cmur = CompleteMultipartUploadRequest {
-            bucket: bucket.clone(),
-            key: object_name.clone(),
-            multipart_upload: Some(CompletedMultipartUpload {
-                parts: Some(completed_parts),
-            }),
-            upload_id: upload_id.clone(),
-            ..Default::default()
-        };
+        debug!("Completing multipart upload of {object_name} with upload_id {upload_id}");
+        let cmu = CompletedMultipartUpload::builder().set_parts(Some(completed_parts.clone())).build();
+        let result = s3
+            .complete_multipart_upload()
+            .bucket(bucket.clone())
+            .key(object_name.clone())
+            .upload_id(upload_id.clone())
+            .multipart_upload(cmu)
+            .send()
+            .await;
 
-        debug!("Completing multipart upload of {} with upload_id {}", object_name, upload_id);
-        match s3.complete_multipart_upload(cmur).await {
+        match result {
             Ok(_) => {
-                debug!("Upload to s3://{}/{} succeeded", bucket, object_name);
+                debug!("Upload to s3://{bucket}/{object_name} succeeded");
                 return Ok(());
             }
 
             Err(e) => {
                 error!(
-                    "Failed to complete multipart upload of s3://{}/{} with upload_id={}: {:?}",
-                    bucket, object_name, upload_id, e
+                    "Failed to complete multipart upload of s3://{bucket}/{object_name} with upload_id={upload_id}: {e:?}"
                 );
                 saved_error = Some(e.into());
             }
         }
     }
 
+    let saved_error = saved_error.unwrap();
+
     // Something happened with at least one part or the CompleteMultipartUpload API. Abort the upload so we are not
     // continually charged for the incompleted upload (which, at this point, won't succeed).
     error!("At least one upload failed; aborting multipart upload");
-    let amur = AbortMultipartUploadRequest {
-        bucket: bucket.clone(),
-        key: object_name.clone(),
-        upload_id: upload_id.clone(),
-        ..Default::default()
-    };
+    let result = s3
+        .abort_multipart_upload()
+        .bucket(bucket.clone())
+        .key(object_name.clone())
+        .upload_id(upload_id.clone())
+        .send()
+        .await;
 
-    match s3.abort_multipart_upload(amur).await {
-        Ok(_) => Err(saved_error.unwrap()),
-        Err(e) => {
-            error!(
-                "Failed to delete multipart upload for s3://{}/{}, upload_id={}: {:?}",
-                bucket, object_name, upload_id, e
-            );
-            Err(saved_error.unwrap())
-        }
+    if let Err(e) = result {
+        error!("Failed to delete multipart upload for s3://{bucket}/{object_name}, upload_id={upload_id}: {e:?}");
     }
+
+    Err(saved_error)
 }
 
 /// Asynchronous task for uploading a part of a file.
@@ -678,44 +664,32 @@ async fn send_file_part(
     bucket_region: Region,
     object_name: String,
     upload_id: String,
-    part_number: i64,
+    part_number: i32,
     start: u64,
     end: u64,
-) -> Result<(i64, String), SendFileError> {
+) -> AnyResult<(i32, String)> {
     let size = end - start;
-    let mut file = match File::open(path.clone()).await {
-        Ok(f) => f,
-        Err(e) => {
-            error!("Unable to reopen temporary file {:?}: {:?}", path, e);
-            return Err(e.into());
-        }
-    };
+    debug!("Uploading {path:?} byte range {start} to {end} with upload_id {upload_id}");
 
-    if let Err(e) = file.seek(SeekFrom::Start(start)).await {
-        error!("Unable to seek to position {} of {:?}: {}", start, path, e);
-        return Err(e.into());
-    }
+    let config = aws_config::load_from_env().await.to_builder().region(bucket_region.clone()).build();
+    let s3 = aws_sdk_s3::Client::new(&config);
+    let byte_stream = FsBuilder::new().path(path).offset(start).length(Length::Exact(size)).build().await?;
 
-    debug!("Uploading {:?} byte range {} to {} with upload_id {:?}", path, start, end, upload_id);
+    let result = s3
+        .upload_part()
+        .bucket(bucket.clone())
+        .key(object_name.clone())
+        .upload_id(upload_id.clone())
+        .part_number(part_number)
+        .content_length(size as i64)
+        .body(byte_stream)
+        .send()
+        .await;
 
-    let file = file.take(size);
-    let s3 = S3Client::new_with_client(get_rusoto_client(), bucket_region.clone());
-
-    let reader = ReaderStream::new(file);
-    let upr = UploadPartRequest {
-        body: Some(ByteStream::new_with_size(reader, size as usize)),
-        bucket: bucket.clone(),
-        content_length: Some(size as i64),
-        key: object_name.clone(),
-        part_number,
-        upload_id,
-        ..Default::default()
-    };
-
-    match s3.upload_part(upr).await {
+    match result {
         Ok(result) => Ok((part_number, result.e_tag.unwrap())),
         Err(e) => {
-            error!("Failed to write to s3://{}/{}: {:?}", bucket, object_name, e);
+            error!("Failed to write to s3://{bucket}/{object_name}: {e:?}");
             Err(e.into())
         }
     }
@@ -724,7 +698,7 @@ async fn send_file_part(
 /// Print usage information.
 fn print_usage<W: Write>(mut writer: W, program: &str, opts: Options) -> Result<(), io::Error> {
     let synopsis = format!(
-        "Usage: {} [options] s3://bucket/prefix/path-template
+        "Usage: {program} [options] s3://bucket/prefix/path-template
 Buffer text logs and write them to S3. The path template can include
 the following variables. Timestamps are generated in the UTC timezone.
 
@@ -738,8 +712,7 @@ the following variables. Timestamps are generated in the UTC timezone.
     {{second}}        The current second as a 2-digit string.
     {{unique}}        A unique identifier to ensure filename uniqueness.
 To include a raw '{{' or '}}' in the output, double it: '{{{{' / '}}}}'.
-",
-        program
+"
     );
     write!(writer, "{}", opts.usage(&synopsis))
 }
@@ -898,8 +871,7 @@ fn evaluate_pattern_at(
                     Some(r) => r,
                     None => {
                         return Err(InvalidS3URL::InvalidTemplateSyntax(format!(
-                            "Unknown template variable '{}'",
-                            var_name
+                            "Unknown template variable '{var_name}'"
                         )));
                     }
                 };
@@ -946,15 +918,6 @@ fn likely_can_open_file(filename: &str) -> Result<(), Box<(dyn Error + 'static)>
     } else {
         Ok(())
     }
-}
-
-/// Create a Rusoto client that auto-refreshes credentials when needed.
-fn get_rusoto_client() -> Client {
-    let chain_provider = ChainProvider::new();
-    let auto_refresh_provider =
-        AutoRefreshingProvider::new(chain_provider).expect("failed to create AutoRefreshingProvider");
-    let dispatcher = HttpClient::new().expect("failed to create request HttpClient requewst dispatcher");
-    Client::new_with(auto_refresh_provider, dispatcher)
 }
 
 #[cfg(test)]
