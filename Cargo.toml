@@ -17,7 +17,7 @@ categories = ["command-line-utilities", "web-programming"]
 anyhow = "^1.0"
 async-compression = { version = "^0.4", features = [ "gzip", "tokio" ] }
 aws-config = { version = "^1.8", features = [ "behavior-version-latest" ] }
-aws-sdk-s3 = "^1.129"
+aws-sdk-s3 = "^1.130"
 aws-smithy-types = { version = "^1.4", features = [ "rt-tokio" ] }
 base32 = "^0.5"
 byte-unit = "^5.2"
