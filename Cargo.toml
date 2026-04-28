@@ -23,6 +23,7 @@ base32 = "^0.5"
 byte-unit = "^5.2"
 clap = { version = "^4.0", features = [ "derive", "env", "wrap_help" ] }
 env_logger = "^0.11"
+fastrand = { version = "2.4", features = [ "std" ] }
 flate2 = { version = "^1.1" }
 futures = "^0.3"
 gethostname = "^1.1"
@@ -30,7 +31,6 @@ get_if_addrs = "^0.5"
 humantime = "^2.3"
 lazy_static = "^1.5"
 log = "^0.4"
-rand = { version = "0.10", features = [ "std", "std_rng" ] }
 regex = "^1.12"
 reqwest = { version = "^0.13", features = [ "json" ] }
 serde = { version = "^1.0", features = [ "derive" ] }

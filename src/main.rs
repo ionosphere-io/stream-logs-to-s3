@@ -24,7 +24,6 @@ use {
     gethostname::gethostname,
     humantime::parse_duration,
     log::{debug, error, info},
-    rand::{Rng as _, rng},
     std::{
         cmp::min, collections::HashMap, error::Error, ffi::OsString, fs::metadata, io::SeekFrom, iter::Extend,
         net::IpAddr, path::PathBuf, process::exit, str::FromStr, time::Duration,
@@ -749,7 +748,7 @@ fn parse_s3_url(s3_url: &str) -> Result<(String, String), InvalidS3URL> {
 fn evaluate_pattern(pattern: &str, host_id: &str) -> Result<String, InvalidS3URL> {
     let now = OffsetDateTime::now_utc();
     let mut unique: [u8; 15] = [0; 15];
-    rng().fill_bytes(&mut unique);
+    fastrand::fill(&mut unique);
     evaluate_pattern_at(pattern, host_id, now, unique)
 }
 

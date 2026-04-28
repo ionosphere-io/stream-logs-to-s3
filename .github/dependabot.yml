@@ -14,6 +14,16 @@ updates:
       all-dependencies:
         patterns:
           - "*"
+    ignore:
+      # rand and quinn are resolved into the lockfile as optional deps of
+      # reqwest (http3 feature) but are never actually compiled. Dependabot
+      # can't update them, so ignore them.
+      - dependency-name: "rand"
+      - dependency-name: "rand_core"
+      - dependency-name: "rand_chacha"
+      - dependency-name: "quinn"
+      - dependency-name: "quinn-proto"
+      - dependency-name: "quinn-udp"
     schedule:
       interval: weekly
       day: "tuesday"
