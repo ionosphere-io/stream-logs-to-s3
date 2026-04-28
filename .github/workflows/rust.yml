@@ -1,11 +1,12 @@
 name: Rust
 
 on:
-  [push, pull_request]
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
 env:
   CARGO_INCREMENTAL: '0'
-  RUSTFLAGS: '-Ccodegen-units=1 -Cinstrument-coverage -Copt-level=0'
-  RUSTDOCFLAGS: '-Ccodegen-units=1 -Cinstrument-coverage -Copt-level=0'
   AWS_REGION: us-west-2
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 permissions:
@@ -13,7 +14,78 @@ permissions:
   contents: read    # This is required for actions/checkout
 
 jobs:
-  build:
+  fmt:
+    name: Formatting check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v6
+    - name: Install Rust nightly
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: nightly
+        components: "rustfmt"
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2.9.1
+      with:
+        shared-key: stream-logs-to-s3-ci-fmt-${{ github.head_ref || github.ref_name }}
+    - name: Run formatting check.
+      run: cargo fmt --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v6
+    - name: Install Rust nightly
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: nightly
+        components: "clippy"
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2.9.1
+      with:
+        shared-key: stream-logs-to-s3-ci-clippy-${{ github.head_ref || github.ref_name }}
+    - name: Run Clippy check.
+      run: cargo clippy -- -Dwarnings
+
+  test:
+    name: Tests and coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: '-Ccodegen-units=1 -Cinstrument-coverage -Copt-level=0'
+      RUSTDOCFLAGS: '-Ccodegen-units=1 -Cinstrument-coverage -Copt-level=0'
+    steps:
+    - uses: actions/checkout@v6
+    - id: aws_creds
+      name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v6.0.0
+      with:
+        role-to-assume: arn:aws:iam::557925715019:role/github-scratchstack-actions
+        role-session-name: github-scratchstack-actions
+        aws-region: ${{ env.AWS_REGION }}
+    - name: Install Rust nightly
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: nightly
+        components: "llvm-tools"
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2.9.1
+      with:
+        shared-key: stream-logs-to-s3-ci-test-${{ github.head_ref || github.ref_name }}
+    - name: Install cargo-llvm-cov
+      run: cargo install cargo-llvm-cov
+    - name: Run tests and gather coverage data
+      env:
+        RUST_LOG: debug
+      run: cargo llvm-cov --tests --html --output-dir coverage-report
+    - name: Upload coverage report to AWS
+      run: aws s3 sync coverage-report/html s3://${{ secrets.COVERAGE_S3_BUCKET }}/coverage/stream-logs-to-s3/${{ github.run_number }} --no-progress
+
+  doc:
+    name: Documentation
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -23,29 +95,16 @@ jobs:
       uses: aws-actions/configure-aws-credentials@v6.0.0
       with:
         role-to-assume: arn:aws:iam::557925715019:role/github-scratchstack-actions
-        role-session-name: github-stream-logs-to-s3-actions
+        role-session-name: github-scratchstack-actions
         aws-region: ${{ env.AWS_REGION }}
     - name: Install Rust nightly
       uses: dtolnay/rust-toolchain@stable
       with:
         toolchain: nightly
-        components: "clippy,rustfmt"
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2.9.1
       with:
-        shared-key: stream-logs-to-s3-ci-${{ github.head_ref || github.ref_name }}
-    - name: Instal cargo-llvm-cov
-      run: cargo install cargo-llvm-cov
-    - name: Run formatting check.
-      run: cargo fmt --check
-    - name: Run Clippy check.
-      run: cargo clippy -- -Dwarnings
-    - name: Run tests and gather coverage data
-      env:
-        RUST_LOG: debug
-      run: cargo llvm-cov --tests --html --output-dir coverage-report
-    - name: Upload coverage report to AWS
-      run: aws s3 sync coverage-report/html s3://${{ secrets.COVERAGE_S3_BUCKET }}/coverage/stream-logs-to-s3/${{ github.run_number }} --no-progress
+        shared-key: stream-logs-to-s3-ci-doc-${{ github.head_ref || github.ref_name }}
     - name: Build documentation
       run: cargo doc --no-deps
     - name: Upload documentation to AWS

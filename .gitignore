@@ -12,3 +12,7 @@
 
 # Visual Studio Code
 .vscode
+*.code-workspace
+
+# Claude
+/.cc-history
