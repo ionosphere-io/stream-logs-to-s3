@@ -11,7 +11,20 @@ repository = "https://github.com/ionosphere-io/stream-logs-to-s3.git"
 keywords = ["logging", "S3", "AWS", "log-streaming"]
 categories = ["command-line-utilities", "web-programming"]
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[profile.release]
+codegen-units = 1
+debug = "none"
+lto = "fat"
+opt-level = "s"
+panic = "abort"
+strip = "symbols"
+
+[profile.dev]
+debug = "full"
+lto = "thin"
+opt-level = 0
+panic = "unwind"
+strip = "none"
 
 [dependencies]
 anyhow = "^1.0"
