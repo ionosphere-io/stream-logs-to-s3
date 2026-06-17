@@ -1,0 +1,149 @@
+name: Release
+
+# Manually-triggered release build. Builds release artifacts for each supported
+# platform on a natively-matching runner, then attaches the zips to a GitHub
+# release tagged with the crate version (e.g. v0.2.1).
+on:
+  workflow_dispatch:
+    inputs:
+      publish-crate:
+        description: "Publish the crate to crates.io"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: Verify branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ensure workflow runs from main
+        run: |
+          if [[ "${{ github.ref }}" != "refs/heads/main" ]]; then
+            echo "This workflow can only be run from the main branch (got ${{ github.ref }})." >&2
+            exit 1
+          fi
+
+  build-linux:
+    name: Build ${{ matrix.os }}-${{ matrix.arch }}
+    needs: guard
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: amzn2023
+            arch: x86_64
+            runner: ubuntu-latest
+          - os: amzn2023
+            arch: aarch64
+            runner: ubuntu-24.04-arm
+          - os: musl
+            arch: x86_64
+            runner: ubuntu-latest
+          - os: musl
+            arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build release zip
+        run: |
+          VERSION=$(egrep '^version = ' Cargo.toml | sed -E -e 's/[^"]+"([^"]+)"/\1/')
+          make stream-logs-to-s3-${VERSION}-${{ matrix.os }}-${{ matrix.arch }}.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.os }}-${{ matrix.arch }}
+          path: stream-logs-to-s3-*.zip
+          if-no-files-found: error
+
+  build-macos:
+    name: Build macos-aarch64
+    needs: guard
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: nightly
+          targets: aarch64-apple-darwin
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2.9.1
+        with:
+          shared-key: stream-logs-to-s3-release-macos
+      - name: Build release zip
+        run: make macos
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-aarch64
+          path: stream-logs-to-s3-*.zip
+          if-no-files-found: error
+
+  publish-crate:
+    name: Publish to crates.io
+    if: ${{ inputs.publish-crate }}
+    needs: [build-linux, build-macos]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      id-token: write   # required for crates.io Trusted Publishing (OIDC)
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Check whether this version is already published
+        id: check
+        run: |
+          VERSION=$(egrep '^version = ' Cargo.toml | sed -E -e 's/[^"]+"([^"]+)"/\1/')
+          if curl -sf -H "User-Agent: ${{ github.repository }} release workflow" \
+              "https://crates.io/api/v1/crates/stream-logs-to-s3/${VERSION}" >/dev/null; then
+            echo "Version ${VERSION} is already on crates.io; skipping publish."
+            echo "already=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Authenticate to crates.io (Trusted Publishing)
+        if: steps.check.outputs.already == 'false'
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+      - name: Publish
+        if: steps.check.outputs.already == 'false'
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  release:
+    name: Create GitHub release
+    needs: [build-linux, build-macos]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write   # required to create the release and the tag
+    steps:
+      - uses: actions/checkout@v6
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create or update release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=$(egrep '^version = ' Cargo.toml | sed -E -e 's/[^"]+"([^"]+)"/\1/')
+          TAG="v${VERSION}"
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists; uploading assets."
+            gh release upload "${TAG}" dist/*.zip --clobber
+          else
+            echo "Creating release ${TAG}."
+            gh release create "${TAG}" dist/*.zip \
+              --target "${{ github.sha }}" \
+              --title "${TAG}" \
+              --generate-notes
+          fi
