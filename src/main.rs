@@ -459,7 +459,8 @@ async fn send_file_single(
     let byte_stream = FsBuilder::new().file(file).length(Length::Exact(size)).build().await?;
 
     info!("Performing single upload for {path:?} of size {size:?}");
-    let result = s3.put_object()
+    let result = s3
+        .put_object()
         .bucket(bucket.clone())
         .body(byte_stream)
         .content_length(size as i64)
@@ -494,7 +495,8 @@ async fn send_file_multi(
     let s3 = aws_sdk_s3::Client::new(&config);
 
     info!("Performing multipart upload for {path:?} of size {size}");
-    let result = s3.create_multipart_upload()
+    let result = s3
+        .create_multipart_upload()
         .bucket(bucket.clone())
         .key(object_name.clone())
         // XXX -- allow encryption algorithm to be specified.
